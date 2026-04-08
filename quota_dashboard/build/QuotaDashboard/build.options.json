@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "..\\..,..\\..,..\\..,..\\..,..\\..,..\\..,..\\..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "compiler.cpp.extra_flags=-ID:\\codex\\boards\\ESP32-S3-RLCD-4.2\\01_Arduino_Libraries\\lvgl8,compiler.c.extra_flags=-ID:\\codex\\boards\\ESP32-S3-RLCD-4.2\\01_Arduino_Libraries\\lvgl8",
+  "fqbn": "esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashMode=qio,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,UploadMode=default,USBMode=hwcdc,UploadSpeed=921600",
+  "hardwareFolders": "C:\\Users\\leile\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7,C:\\Users\\leile\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.7",
+  "otherLibrariesFolders": "C:\\Users\\leile\\Documents\\Arduino\\libraries",
+  "sketchLocation": "D:\\codex\\quota_dashboard\\esp32\\QuotaDashboard"
+}

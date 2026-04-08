@@ -1,0 +1,60 @@
+# Quota Dashboard
+
+本工程包含两部分：
+
+- `quota_server.py`
+  - 在本机读取 `Antigravity Tools` 本地接口
+  - 在本机读取 `Codex Tools` 的 `accounts.json`
+  - 输出给 ESP32 更容易解析的文本接口
+- `esp32/QuotaDashboard`
+  - 微雪 `ESP32-S3-RLCD-4.2` 屏幕程序
+  - 动态显示时间、电池、账号额度、额度刷新时间
+  - 账号数变化时自动分页
+
+## 本机服务
+
+启动：
+
+```powershell
+C:\Users\leile\AppData\Local\Programs\Python\Python311\python.exe D:\codex\quota_dashboard\quota_server.py
+```
+
+接口：
+
+- `http://127.0.0.1:8765/health`
+- `http://127.0.0.1:8765/api/summary.json`
+- `http://127.0.0.1:8765/api/esp.txt`
+
+`/api/esp.txt` 示例：
+
+```text
+META|1775655600|2026-04-08 21:40:00|6
+ROW|AG|caoyanping4365@gmail.com|Gem 100%|Cld 100%|04-15 20:59
+ROW|CX|leilei4365@gmail.com|5H 21%|1W 21%|04-10 18:01
+```
+
+## ESP32 配置
+
+修改 [config.h](D:\codex\quota_dashboard\esp32\QuotaDashboard\config.h)：
+
+- `WIFI_SSID`
+- `WIFI_PASSWORD`
+- `DASHBOARD_URL`
+
+如果你的电脑局域网 IP 是 `192.168.1.100`，则：
+
+```cpp
+static const char *DASHBOARD_URL = "http://192.168.1.100:8765/api/esp.txt";
+```
+
+## Arduino 推荐参数
+
+- Board: `ESP32S3 Dev Module`
+- Port: 开发板对应串口
+- USB CDC On Boot: `Enabled`
+- Flash Mode: `QIO 80MHz`
+- Flash Size: `16MB`
+- Partition Scheme: `16M Flash (3MB APP/9.9MB FATFS)`
+- PSRAM: `OPI PSRAM`
+- Upload Mode: `UART0 / Hardware CDC`
+- USB Mode: `Hardware CDC and JTAG`
