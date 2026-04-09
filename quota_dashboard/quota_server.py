@@ -14,10 +14,14 @@ ANTIGRAVITY_API = os.environ.get("ANTIGRAVITY_API", "http://127.0.0.1:8045/api/a
 CODEX_ACCOUNTS_FILE = Path(
     os.environ.get(
         "CODEX_ACCOUNTS_FILE",
-        r"C:\Users\leile\AppData\Roaming\com.carry.codex-tools\accounts.json",
+        str(Path.home() / "AppData" / "Roaming" / "com.carry.codex-tools" / "accounts.json"),
     )
 )
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
+LAST_GOOD_ROWS = {
+    "AG": [],
+    "CX": [],
+}
 
 
 def safe_text(value, limit=48):
@@ -26,18 +30,43 @@ def safe_text(value, limit=48):
     return text[:limit]
 
 
+def email_prefix(value):
+    text = "" if value is None else str(value)
+    at = text.find("@")
+    if at >= 0:
+        text = text[:at]
+    return text
+
+
+def fmt_reset_diff(target_dt):
+    """Return compact time-until-reset: '2d 3h', '5h', '45m', or '<1h' if past."""
+    now = datetime.now(tz=LOCAL_TZ)
+    diff = target_dt - now
+    total_seconds = int(diff.total_seconds())
+    if total_seconds <= 0:
+        return "<1h"
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    if days > 0:
+        return f"{days}d{hours}h"  # compact: no space, e.g. "6d21h"
+    if hours > 0:
+        return f"{hours}h"
+    minutes = (total_seconds % 3600) // 60
+    return f"{minutes}m"
+
+
 def fmt_reset(ts):
     if not ts:
         return "-"
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(LOCAL_TZ)
-    return dt.strftime("%m-%d %H:%M")
+    return fmt_reset_diff(dt)
 
 
 def fmt_reset_iso(iso_text):
     if not iso_text:
         return "-"
     dt = datetime.fromisoformat(iso_text.replace("Z", "+00:00")).astimezone(LOCAL_TZ)
-    return dt.strftime("%m-%d %H:%M")
+    return fmt_reset_diff(dt)
 
 
 def average_percent(models, prefixes):
@@ -73,12 +102,23 @@ def load_antigravity_rows():
         models = quota.get("models") or []
         gemini = average_percent(models, ["gemini-"])
         claude = average_percent(models, ["claude-"])
+        gem_reset = nearest_reset_iso(models, ["gemini-"])
+        cld_reset = nearest_reset_iso(models, ["claude-"])
+        # Combine into compact field e.g. "G:2h/C:5d7h"
+        if gem_reset != "-" and cld_reset != "-":
+            combined_reset = f"G:{gem_reset}/C:{cld_reset}"
+        elif gem_reset != "-":
+            combined_reset = f"G:{gem_reset}"
+        elif cld_reset != "-":
+            combined_reset = f"C:{cld_reset}"
+        else:
+            combined_reset = "-"
         row = {
             "platform": "AG",
             "email": safe_text(account.get("email") or account.get("label") or "unknown"),
             "metric1": f"Gem {gemini}%" if gemini is not None else "Gem -",
             "metric2": f"Cld {claude}%" if claude is not None else "Cld -",
-            "reset": nearest_reset_iso(models, ["gemini-", "claude-"]),
+            "reset": combined_reset,
             "sort": 0 if account.get("is_current") else 1,
         }
         rows.append(row)
@@ -117,14 +157,20 @@ def build_snapshot():
     errors = []
 
     try:
-        rows.extend(load_antigravity_rows())
+        ag_rows = load_antigravity_rows()
+        LAST_GOOD_ROWS["AG"] = ag_rows
+        rows.extend(ag_rows)
     except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
         errors.append(f"antigravity: {exc}")
+        rows.extend(LAST_GOOD_ROWS["AG"])
 
     try:
-        rows.extend(load_codex_rows())
+        cx_rows = load_codex_rows()
+        LAST_GOOD_ROWS["CX"] = cx_rows
+        rows.extend(cx_rows)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         errors.append(f"codex: {exc}")
+        rows.extend(LAST_GOOD_ROWS["CX"])
 
     return {
         "epoch": int(now.timestamp()),
@@ -138,10 +184,11 @@ def build_snapshot():
 def build_text(snapshot):
     lines = [f"META|{snapshot['epoch']}|{safe_text(snapshot['updated_at'], 24)}|{snapshot['count']}"]
     for row in snapshot["rows"]:
+        display_email = email_prefix(row["email"])
         lines.append(
             "ROW|{platform}|{email}|{metric1}|{metric2}|{reset}".format(
                 platform=safe_text(row["platform"], 4),
-                email=safe_text(row["email"], 48),
+                email=safe_text(display_email, 48),
                 metric1=safe_text(row["metric1"], 16),
                 metric2=safe_text(row["metric2"], 16),
                 reset=safe_text(row["reset"], 16),
