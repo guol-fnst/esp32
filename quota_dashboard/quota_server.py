@@ -23,6 +23,52 @@ LAST_GOOD_ROWS = {
     "CX": [],
 }
 
+# Nanjing Yuhuatai (31.9927°N 118.7749°E)
+WEATHER_API = (
+    "https://api.open-meteo.com/v1/forecast"
+    "?latitude=31.9927&longitude=118.7749"
+    "&daily=temperature_2m_max,temperature_2m_min,weathercode"
+    "&timezone=Asia%2FShanghai&forecast_days=3"
+)
+WEATHER_CACHE: dict = {"days": None, "ts": 0.0}
+
+
+def load_weather():
+    """Fetch 3-day forecast. Cache for 1 hour."""
+    now_ts = datetime.now(tz=LOCAL_TZ).timestamp()
+    if WEATHER_CACHE["days"] is not None and now_ts - WEATHER_CACHE["ts"] < 3600:
+        return WEATHER_CACHE["days"]
+    with urlopen(WEATHER_API, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+    daily = data["daily"]
+    days = []
+    for i in range(min(3, len(daily["time"]))):
+        date_fmt = daily["time"][i][5:].replace("-", "/")  # "04/09"
+        tmax = round(daily["temperature_2m_max"][i])
+        tmin = round(daily["temperature_2m_min"][i])
+        code = int(daily["weathercode"][i])
+        days.append({"date": date_fmt, "temp": f"{tmax}/{tmin}", "code": code})
+    WEATHER_CACHE["days"] = days
+    WEATHER_CACHE["ts"] = now_ts
+    return days
+
+# China public holidays 2026 (ISO local dates)
+CHINA_HOLIDAYS_2026 = frozenset([
+    "2026-01-01", "2026-01-02", "2026-01-03",                    # New Year
+    "2026-01-27", "2026-01-28", "2026-01-29", "2026-01-30",     # Spring Festival
+    "2026-01-31", "2026-02-01", "2026-02-02", "2026-02-03",
+    "2026-04-04", "2026-04-05", "2026-04-06",                    # Qingming
+    "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",  # Labor Day
+    "2026-06-19", "2026-06-20", "2026-06-21",                    # Dragon Boat
+    "2026-09-24", "2026-09-25", "2026-09-26",                    # Mid-Autumn
+    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
+    "2026-10-05", "2026-10-06", "2026-10-07",                    # National Day
+])
+
+
+def is_holiday_today():
+    return datetime.now(tz=LOCAL_TZ).date().isoformat() in CHINA_HOLIDAYS_2026
+
 
 def safe_text(value, limit=48):
     text = "" if value is None else str(value)
@@ -119,6 +165,7 @@ def load_antigravity_rows():
             "metric1": f"Gem {gemini}%" if gemini is not None else "Gem -",
             "metric2": f"Cld {claude}%" if claude is not None else "Cld -",
             "reset": combined_reset,
+            "cx_reset_sec": 9999999,  # AG rows have no CX reset; sort to end
             "sort": 0 if account.get("is_current") else 1,
         }
         rows.append(row)
@@ -129,6 +176,7 @@ def load_antigravity_rows():
 
 def load_codex_rows():
     payload = json.loads(CODEX_ACCOUNTS_FILE.read_text(encoding="utf-8"))
+    now_ts = datetime.now(tz=timezone.utc).timestamp()
     rows = []
     for account in payload.get("accounts", []):
         usage = account.get("usage") or {}
@@ -137,17 +185,25 @@ def load_codex_rows():
         remaining_5h = max(0, min(100, round(100 - float(five_hour.get("usedPercent", 0)))))
         remaining_1w = max(0, min(100, round(100 - float(one_week.get("usedPercent", 0)))))
         reset_candidates = [ts for ts in [five_hour.get("resetAt"), one_week.get("resetAt")] if ts]
+        if reset_candidates:
+            nearest_ts = min(reset_candidates)
+            reset_str = fmt_reset(nearest_ts)
+            cx_reset_sec = max(0, int(nearest_ts - now_ts))
+        else:
+            reset_str = "-"
+            cx_reset_sec = 9999999
         row = {
             "platform": "CX",
             "email": safe_text(account.get("email") or account.get("label") or "unknown"),
             "metric1": f"5H {remaining_5h}%",
             "metric2": f"1W {remaining_1w}%",
-            "reset": fmt_reset(min(reset_candidates)) if reset_candidates else "-",
-            "sort": 0,
+            "reset": reset_str,
+            "cx_reset_sec": cx_reset_sec,
         }
         rows.append(row)
 
-    rows.sort(key=lambda item: item["email"].lower())
+    # Pre-sort by soonest reset; firmware will re-sort after merging with AG
+    rows.sort(key=lambda r: r["cx_reset_sec"])
     return rows
 
 
@@ -183,19 +239,28 @@ def build_snapshot():
 
 def build_text(snapshot):
     lines = [f"META|{snapshot['epoch']}|{safe_text(snapshot['updated_at'], 24)}|{snapshot['count']}"]
+    lines.append(f"HOLIDAY|{1 if is_holiday_today() else 0}")
     for row in snapshot["rows"]:
         display_email = email_prefix(row["email"])
         lines.append(
-            "ROW|{platform}|{email}|{metric1}|{metric2}|{reset}".format(
+            "ROW|{platform}|{email}|{metric1}|{metric2}|{reset}|{sort_key}".format(
                 platform=safe_text(row["platform"], 4),
                 email=safe_text(display_email, 48),
                 metric1=safe_text(row["metric1"], 16),
                 metric2=safe_text(row["metric2"], 16),
                 reset=safe_text(row["reset"], 16),
+                sort_key=row.get("cx_reset_sec", 9999999),
             )
         )
     if snapshot["errors"]:
         lines.append("ERR|" + safe_text("; ".join(snapshot["errors"]), 180))
+    # Weather (cached 1h, non-fatal if unavailable)
+    try:
+        weather = load_weather()
+        wfields = "|".join(f"{d['date']}|{d['temp']}|{d['code']}" for d in weather)
+        lines.append(f"WEATHER|{wfields}")
+    except Exception:
+        pass
     return "\n".join(lines) + "\n"
 
 

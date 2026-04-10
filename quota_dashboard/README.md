@@ -25,6 +25,8 @@ C:\Users\leile\AppData\Local\Programs\Python\Python311\python.exe D:\codex\quota
 - `http://127.0.0.1:8765/api/summary.json`
 - `http://127.0.0.1:8765/api/esp.txt`
 
+服务默认监听 `0.0.0.0:8765`，局域网访问请使用本机 IP。
+
 `/api/esp.txt` 示例：
 
 ```text
@@ -45,6 +47,48 @@ ROW|CX|leilei4365@gmail.com|5H 21%|1W 21%|04-10 18:01
 
 ```cpp
 static const char *DASHBOARD_URL = "http://192.168.1.100:8765/api/esp.txt";
+```
+
+默认刷新周期为 5 分钟，可在 `config.h` 中修改 `FETCH_INTERVAL_MS`。
+
+## Arduino CLI 编译与烧录
+
+先安装并配置 `arduino-cli`（已安装 ESP32 core）：
+
+```powershell
+arduino-cli board list
+```
+
+编译：
+
+```powershell
+arduino-cli compile --fqbn esp32:esp32:esp32s3 .\esp32\QuotaDashboard
+```
+
+烧录（将 `COM7` 替换为你的串口）：
+
+```powershell
+arduino-cli upload -p COM7 --fqbn esp32:esp32:esp32s3 .\esp32\QuotaDashboard
+```
+
+## Windows 防火墙（仅局域网放行）
+
+以管理员身份运行 PowerShell，按你的网段放行 8765 端口（示例为 `192.168.1.0/24`）：
+
+```powershell
+netsh advfirewall firewall add rule name="quota-dashboard" dir=in action=allow protocol=TCP localport=8765 remoteip=192.168.1.0/24 enable=yes
+```
+
+验证规则：
+
+```powershell
+netsh advfirewall firewall show rule name="quota-dashboard"
+```
+
+局域网验证：
+
+```powershell
+curl http://<你的电脑IP>:8765/health
 ```
 
 ## Arduino 推荐参数

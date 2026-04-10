@@ -2,6 +2,7 @@
 #include <HTTPClient.h>
 #include <time.h>
 #include <ctype.h>
+#include <esp_sleep.h>
 
 #include "display_bsp.h"
 #include "lvgl_bsp.h"
@@ -14,7 +15,7 @@ static const int BUTTON_PIN = 0;
 static const int SCREEN_WIDTH = 400;
 static const int SCREEN_HEIGHT = 300;
 static const int MAX_ROWS = 24;
-static const int VISIBLE_ROWS = 5;
+static const int VISIBLE_ROWS = 4;  // row 5 is reserved for weather
 
 // Row panel layout
 static const int ROW_H = 50;              // panel height px
@@ -33,11 +34,13 @@ struct DashboardRow {
   char metric1[17];
   char metric2[17];
   char reset[17];
+  long sortKey;  // seconds until CX reset (9999999 = no data)
 };
 
 DisplayPort RlcdPort(12, 11, 5, 40, 41, SCREEN_WIDTH, SCREEN_HEIGHT);
 DashboardRow rows[MAX_ROWS];
 int rowCount = 0;
+bool g_isHoliday = false;  // set by server HOLIDAY line each fetch
 char lastSyncText[25] = "-";
 char errorText[96] = "";
 
@@ -64,7 +67,37 @@ lv_obj_t *rowCxLabels[VISIBLE_ROWS];
 lv_obj_t *rowAgOuterArcs[VISIBLE_ROWS];  // Gemini (outer)
 lv_obj_t *rowAgInnerArcs[VISIBLE_ROWS]; // Claude (inner)
 
-// Per-person combined row (CX + AG merged by email prefix)
+// Weather panel (bottom row)
+struct WeatherDay {
+  char date[6];  // "04/09"
+  char temp[8];  // "25/12"
+  int  code;     // WMO weather code
+};
+static WeatherDay g_weather[3];
+static bool g_weatherValid = false;
+lv_obj_t *weatherPanel   = nullptr;
+lv_obj_t *wDateLabels[3];
+lv_obj_t *wInfoLabels[3];
+
+LV_FONT_DECLARE(lv_font_weather_cjk);
+
+const char* wmoText(int code) {
+  if (code <= 1)  return "\u6674";           // 晴
+  if (code == 2)  return "\u591a\u4e91";    // 多云
+  if (code == 3)  return "\u9634";           // 阴
+  if (code <= 48) return "\u96fe";           // 雾
+  if (code <= 57) return "\u5c0f\u96e8";   // 小雨 (drizzle)
+  if (code <= 61) return "\u5c0f\u96e8";   // 小雨
+  if (code <= 63) return "\u4e2d\u96e8";   // 中雨
+  if (code <= 67) return "\u5927\u96e8";   // 大雨
+  if (code <= 71) return "\u5c0f\u96ea";   // 小雪
+  if (code <= 73) return "\u4e2d\u96ea";   // 中雪
+  if (code <= 77) return "\u5927\u96ea";   // 大雪
+  if (code <= 82) return "\u9635\u96e8";   // 阵雨
+  if (code <= 86) return "\u9635\u96ea";   // 阵雪
+  if (code <= 99) return "\u96f7\u96e8";   // 雷雨
+  return "---";
+}
 struct CombinedRow {
   char email[49];
   int  cxScore;      // CX remaining %,       -1 = no data
@@ -72,6 +105,7 @@ struct CombinedRow {
   int  agClaude;     // AG Claude remaining %, -1 = no data
   char cxReset[12];  // CX reset countdown e.g. "6d23h"
   char agReset[20];  // AG reset e.g. "G:2h/C:5d7h"
+  long cxResetSec;   // seconds until CX reset; 9999999 = no CX data
 };
 CombinedRow combined[MAX_ROWS];
 int combinedCount = 0;
@@ -202,9 +236,10 @@ int buildCombinedRows() {
   combinedCount = 0;
   memset(combined, 0, sizeof(combined));
   for (int i = 0; i < MAX_ROWS; i++) {
-    combined[i].cxScore  = -1;
-    combined[i].agGemini = -1;
-    combined[i].agClaude = -1;
+    combined[i].cxScore    = -1;
+    combined[i].agGemini   = -1;
+    combined[i].agClaude   = -1;
+    combined[i].cxResetSec = 9999999L;
   }
 
   for (int i = 0; i < rowCount; i++) {
@@ -222,13 +257,15 @@ int buildCombinedRows() {
       combined[idx].cxScore  = -1;
       combined[idx].agGemini = -1;
       combined[idx].agClaude = -1;
-      combined[idx].cxReset[0] = '\0';
-      combined[idx].agReset[0] = '\0';
+      combined[idx].cxReset[0]  = '\0';
+      combined[idx].agReset[0]   = '\0';
+      combined[idx].cxResetSec   = 9999999L;
     }
 
     if (strncmp(rows[i].platform, "CX", 2) == 0) {
       int score = rowScore(rows[i]);
-      combined[idx].cxScore = (score < 0 || score > 100) ? 0 : score;
+      combined[idx].cxScore    = (score < 0 || score > 100) ? 0 : score;
+      combined[idx].cxResetSec = rows[i].sortKey;
       safeCopy(combined[idx].cxReset, sizeof(combined[idx].cxReset), rows[i].reset);
     } else if (strncmp(rows[i].platform, "AG", 2) == 0) {
       int gem = extractPercent(rows[i].metric1);
@@ -239,20 +276,11 @@ int buildCombinedRows() {
     }
   }
 
-  // Sort: lowest remaining quota at top
+  // Sort: soonest CX reset first (ascending cxResetSec); no-CX users sort to end
   for (int i = 1; i < combinedCount; i++) {
     CombinedRow key = combined[i];
-    int keyWorst = 101;
-    if (key.cxScore  >= 0) keyWorst = min(keyWorst, key.cxScore);
-    if (key.agGemini >= 0) keyWorst = min(keyWorst, key.agGemini);
-    if (key.agClaude >= 0) keyWorst = min(keyWorst, key.agClaude);
     int j = i - 1;
-    while (j >= 0) {
-      int lw = 101;
-      if (combined[j].cxScore  >= 0) lw = min(lw, combined[j].cxScore);
-      if (combined[j].agGemini >= 0) lw = min(lw, combined[j].agGemini);
-      if (combined[j].agClaude >= 0) lw = min(lw, combined[j].agClaude);
-      if (lw <= keyWorst) break;
+    while (j >= 0 && combined[j].cxResetSec > key.cxResetSec) {
       combined[j + 1] = combined[j];
       j--;
     }
@@ -264,6 +292,7 @@ int buildCombinedRows() {
 
 bool parseDashboardPayload(String payload) {
   resetRows();
+  g_isHoliday = false;  // assume workday; server overrides if today is a holiday
   int start = 0;
   while (start < payload.length()) {
     int end = payload.indexOf('\n', start);
@@ -279,7 +308,7 @@ bool parseDashboardPayload(String payload) {
 
     char buffer[192];
     safeCopy(buffer, sizeof(buffer), line.c_str());
-    char *parts[6] = {0};
+    char *parts[7] = {0};
 
     if (strncmp(buffer, "META|", 5) == 0) {
       if (splitField(buffer, parts, 4)) {
@@ -290,16 +319,22 @@ bool parseDashboardPayload(String payload) {
       continue;
     }
 
+    if (strncmp(buffer, "HOLIDAY|", 8) == 0) {
+      g_isHoliday = (buffer[8] == '1');
+      continue;
+    }
+
     if (strncmp(buffer, "ROW|", 4) == 0) {
       if (rowCount >= MAX_ROWS) {
         continue;
       }
-      if (splitField(buffer, parts, 6)) {
+      if (splitField(buffer, parts, 7)) {
         safeCopy(rows[rowCount].platform, sizeof(rows[rowCount].platform), parts[1]);
         safeCopy(rows[rowCount].email, sizeof(rows[rowCount].email), parts[2]);
         safeCopy(rows[rowCount].metric1, sizeof(rows[rowCount].metric1), parts[3]);
         safeCopy(rows[rowCount].metric2, sizeof(rows[rowCount].metric2), parts[4]);
         safeCopy(rows[rowCount].reset, sizeof(rows[rowCount].reset), parts[5]);
+        rows[rowCount].sortKey = atol(parts[6]);
         rowCount++;
       }
       continue;
@@ -307,6 +342,22 @@ bool parseDashboardPayload(String payload) {
 
     if (strncmp(buffer, "ERR|", 4) == 0) {
       safeCopy(errorText, sizeof(errorText), buffer + 4);
+    }
+
+    if (strncmp(buffer, "WEATHER|", 8) == 0) {
+      // Format: WEATHER|MM/DD|tmax/tmin|code|MM/DD|tmax/tmin|code|MM/DD|tmax/tmin|code
+      char *wp[10] = {0};
+      if (splitField(buffer, wp, 10)) {
+        bool ok = true;
+        for (int i = 0; i < 3; i++) {
+          int b = 1 + i * 3;
+          if (!wp[b] || !wp[b+1] || !wp[b+2]) { ok = false; break; }
+          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wp[b]);
+          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wp[b+1]);
+          g_weather[i].code = atoi(wp[b+2]);
+        }
+        if (ok) g_weatherValid = true;
+      }
     }
   }
 
@@ -365,7 +416,7 @@ void createUi() {
 
   // ---- header row ----
   lv_obj_t *title = lv_label_create(screen);
-  lv_label_set_text(title, "Quota Dashboard v6");
+  lv_label_set_text(title, "Quota Dashboard v9");
   lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 10, 4);
 
@@ -477,12 +528,144 @@ void createUi() {
     lv_obj_align(detailLbl, LV_ALIGN_TOP_LEFT, TEXT_X, 24);
   }
 
+  // ---- weather panel (below data rows) ----
+  {
+    int wpY = HEADER_H + VISIBLE_ROWS * ROW_H;
+    lv_obj_t *wp = lv_obj_create(screen);
+    weatherPanel = wp;
+    lv_obj_set_size(wp, 390, ROW_H - 2);
+    lv_obj_set_style_bg_color(wp, lv_color_white(), 0);
+    lv_obj_set_style_border_color(wp, lv_color_black(), 0);
+    lv_obj_set_style_border_width(wp, 1, 0);
+    lv_obj_set_style_radius(wp, 3, 0);
+    lv_obj_set_style_pad_all(wp, 0, 0);
+    lv_obj_align(wp, LV_ALIGN_TOP_LEFT, 5, wpY);
+
+    static const int COL_W = 128;
+    for (int i = 0; i < 3; i++) {
+      int cx = 6 + i * COL_W;
+      lv_obj_t *dl = lv_label_create(wp);
+      wDateLabels[i] = dl;
+      lv_label_set_text(dl, "--/--");
+      lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+      lv_obj_set_width(dl, COL_W - 4);
+      lv_label_set_long_mode(dl, LV_LABEL_LONG_CLIP);
+      lv_obj_align(dl, LV_ALIGN_TOP_LEFT, cx, 4);
+
+      lv_obj_t *il = lv_label_create(wp);
+      wInfoLabels[i] = il;
+      lv_label_set_text(il, "--/-- ---");
+      lv_obj_set_style_text_font(il, &lv_font_weather_cjk, 0);
+      lv_obj_set_width(il, COL_W - 4);
+      lv_label_set_long_mode(il, LV_LABEL_LONG_CLIP);
+      lv_obj_align(il, LV_ALIGN_TOP_LEFT, cx, 24);
+    }
+  }
+
   // ---- footer ----
   footerLabel = lv_label_create(screen);
   lv_label_set_text(footerLabel, "OpenAI Rows 0  Page 1/1  Sync -");
   lv_obj_set_style_text_font(footerLabel, &lv_font_montserrat_14, 0);
   lv_obj_align(footerLabel, LV_ALIGN_BOTTOM_LEFT, 8, -4);
 }
+
+void updateWeatherPanel() {
+  if (!g_weatherValid) return;
+  if (!Lvgl_lock(200)) return;
+  lv_obj_clear_flag(weatherPanel, LV_OBJ_FLAG_HIDDEN);
+  for (int i = 0; i < 3; i++) {
+    lv_label_set_text(wDateLabels[i], g_weather[i].date);
+    char info[20];
+    snprintf(info, sizeof(info), "%s %s", g_weather[i].temp, wmoText(g_weather[i].code));
+    lv_label_set_text(wInfoLabels[i], info);
+  }
+  Lvgl_unlock();
+}
+
+// ---------- Sleep / schedule helpers ----------
+
+// True if current local time is Mon-Fri 09:00-19:59
+bool isWorkHours() {
+  if (baseEpoch <= 0) return true;  // no time sync: stay active
+  time_t nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+  struct tm t;
+  gmtime_r(&nowLocal, &t);
+  if (t.tm_wday == 0 || t.tm_wday == 6) return false;  // Sun / Sat
+  return (t.tm_hour >= 9 && t.tm_hour < 20);
+}
+
+// Returns "local epoch" (UTC+8 as fake-UTC) of next weekday 09:00
+time_t nextWorkWakeEpoch() {
+  time_t nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+  struct tm t;
+  gmtime_r(&nowLocal, &t);
+  struct tm wake = t;
+  wake.tm_hour = 9;
+  wake.tm_min  = 0;
+  wake.tm_sec  = 0;
+  time_t wakeLocal = mktime(&wake);
+  for (int i = 0; i < 7; i++) {
+    struct tm w;
+    gmtime_r(&wakeLocal, &w);
+    if (w.tm_wday != 0 && w.tm_wday != 6 && wakeLocal > nowLocal) return wakeLocal;
+    wakeLocal += 86400;
+  }
+  return nowLocal + 86400;  // fallback: 24 h
+}
+
+void showSleepScreen() {
+  time_t wakeEpoch = nextWorkWakeEpoch();
+  struct tm w;
+  gmtime_r(&wakeEpoch, &w);
+  char wakeStr[20];
+  strftime(wakeStr, sizeof(wakeStr), "%m/%d %H:%M", &w);
+
+  if (Lvgl_lock(1000)) {
+    for (int i = 0; i < VISIBLE_ROWS; i++) {
+      lv_obj_add_flag(rowPanels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_label_set_text(timeLabel, "--:--");
+    lv_label_set_text(batteryLabel, "");
+    lv_label_set_text(footerLabel, "");
+    char msg[52];
+    snprintf(msg, sizeof(msg), "SLEEPING\nWake: %s", wakeStr);
+    lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(errorLabel, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(errorLabel, msg);
+    Lvgl_unlock();
+  }
+  delay(4000);  // let e-ink finish refreshing before power-down
+}
+
+void enterOffHoursMode() {
+  showSleepScreen();       // display retention: e-ink shows this while CPU sleeps
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+
+  // Light sleep in 5-minute intervals until work hours resume.
+  // Light sleep preserves PSRAM, so LVGL state remains intact.
+  while (g_isHoliday || !isWorkHours()) {
+    esp_sleep_enable_timer_wakeup(5ULL * 60ULL * 1000000ULL);  // 5 min
+    esp_light_sleep_start();  // CPU halts here; millis() continues via RTC
+    // woke up due to timer — loop to re-check time
+  }
+
+  // Work hours resumed — restore screen and reconnect
+  if (Lvgl_lock(1000)) {
+    lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_align(errorLabel, LV_ALIGN_TOP_LEFT, 10, 4);
+    lv_label_set_text(errorLabel, "");
+    for (int i = 0; i < VISIBLE_ROWS; i++) {
+      lv_obj_clear_flag(rowPanels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    Lvgl_unlock();
+  }
+  connectWifi();
+  g_isHoliday = false;  // stale flag; next fetchDashboard will set it correctly
+}
+
+// ----------------------------------------------
 
 void refreshClockAndBattery(bool force = false) {
   if (baseEpoch <= 0) {
@@ -510,6 +693,11 @@ void refreshClockAndBattery(bool force = false) {
     lv_label_set_text(timeLabel, timeBuf);
     lv_label_set_text(batteryLabel, battBuf);
     Lvgl_unlock();
+  }
+
+  // Check work schedule once per minute; light sleep if outside hours or holiday
+  if (g_isHoliday || !isWorkHours()) {
+    enterOffHoursMode();
   }
 }
 
@@ -585,6 +773,7 @@ void renderRows() {
     lv_label_set_text(footerLabel, footer);
     Lvgl_unlock();
   }
+  updateWeatherPanel();
 }
 
 void updatePagination() {
@@ -612,7 +801,7 @@ void setup() {
   connectWifi();
   fetchDashboard();
   renderRows();
-  refreshClockAndBattery(true);
+  refreshClockAndBattery(true);  // check work hours after first render
   lastFetchMs = millis();
   lastPageMs = millis();
 }
