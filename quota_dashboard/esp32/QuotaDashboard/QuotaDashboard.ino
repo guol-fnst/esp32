@@ -16,6 +16,7 @@ static const int SCREEN_WIDTH = 400;
 static const int SCREEN_HEIGHT = 300;
 static const int MAX_ROWS = 24;
 static const int VISIBLE_ROWS = 4;  // row 5 is reserved for weather
+static const int WEATHER_DAYS = 5;
 
 // Row panel layout
 static const int ROW_H = 50;              // panel height px
@@ -56,6 +57,7 @@ static unsigned long buttonPressMs = 0;
 static bool buttonLastState = HIGH;
 
 lv_obj_t *timeLabel = nullptr;
+lv_obj_t *wifiLabel = nullptr;
 lv_obj_t *batteryLabel = nullptr;
 lv_obj_t *footerLabel = nullptr;
 lv_obj_t *errorLabel = nullptr;
@@ -73,11 +75,13 @@ struct WeatherDay {
   char temp[8];  // "25/12"
   int  code;     // WMO weather code
 };
-static WeatherDay g_weather[3];
+static WeatherDay g_weather[WEATHER_DAYS];
 static bool g_weatherValid = false;
+static int g_currentTempC = -1000;
 lv_obj_t *weatherPanel   = nullptr;
-lv_obj_t *wDateLabels[3];
-lv_obj_t *wInfoLabels[3];
+lv_obj_t *wDateLabels[WEATHER_DAYS];
+lv_obj_t *wInfoLabels[WEATHER_DAYS];
+lv_obj_t *wTempLabels[WEATHER_DAYS];
 
 LV_FONT_DECLARE(lv_font_weather_cjk);
 
@@ -345,16 +349,30 @@ bool parseDashboardPayload(String payload) {
     }
 
     if (strncmp(buffer, "WEATHER|", 8) == 0) {
-      // Format: WEATHER|MM/DD|tmax/tmin|code|MM/DD|tmax/tmin|code|MM/DD|tmax/tmin|code
-      char *wp[10] = {0};
-      if (splitField(buffer, wp, 10)) {
+      // New format: WEATHER|curTemp|MM/DD|tmax/tmin|code|... (5 days)
+      // Legacy format: WEATHER|MM/DD|tmax/tmin|code|... (5 days)
+      char *wpNew[2 + WEATHER_DAYS * 3] = {0};
+      char *wpOld[1 + WEATHER_DAYS * 3] = {0};
+      if (splitField(buffer, wpNew, 2 + WEATHER_DAYS * 3)) {
         bool ok = true;
-        for (int i = 0; i < 3; i++) {
+        g_currentTempC = atoi(wpNew[1]);
+        for (int i = 0; i < WEATHER_DAYS; i++) {
+          int b = 2 + i * 3;
+          if (!wpNew[b] || !wpNew[b + 1] || !wpNew[b + 2]) { ok = false; break; }
+          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wpNew[b]);
+          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wpNew[b + 1]);
+          g_weather[i].code = atoi(wpNew[b + 2]);
+        }
+        if (ok) g_weatherValid = true;
+      } else if (splitField(buffer, wpOld, 1 + WEATHER_DAYS * 3)) {
+        bool ok = true;
+        g_currentTempC = -1000;
+        for (int i = 0; i < WEATHER_DAYS; i++) {
           int b = 1 + i * 3;
-          if (!wp[b] || !wp[b+1] || !wp[b+2]) { ok = false; break; }
-          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wp[b]);
-          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wp[b+1]);
-          g_weather[i].code = atoi(wp[b+2]);
+          if (!wpOld[b] || !wpOld[b + 1] || !wpOld[b + 2]) { ok = false; break; }
+          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wpOld[b]);
+          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wpOld[b + 1]);
+          g_weather[i].code = atoi(wpOld[b + 2]);
         }
         if (ok) g_weatherValid = true;
       }
@@ -417,18 +435,23 @@ void createUi() {
   // ---- header row ----
   lv_obj_t *title = lv_label_create(screen);
   lv_label_set_text(title, "Quota Dashboard v9");
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 10, 4);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 8, 5);
 
   timeLabel = lv_label_create(screen);
   lv_label_set_text(timeLabel, "--:--");
-  lv_obj_set_style_text_font(timeLabel, &lv_font_montserrat_14, 0);
-  lv_obj_align(timeLabel, LV_ALIGN_TOP_LEFT, 200, 4);
+  lv_obj_set_style_text_font(timeLabel, &lv_font_montserrat_12, 0);
+  lv_obj_align(timeLabel, LV_ALIGN_TOP_MID, -38, 5);
+
+  wifiLabel = lv_label_create(screen);
+  lv_label_set_text(wifiLabel, "WiFi --");
+  lv_obj_set_style_text_font(wifiLabel, &lv_font_montserrat_12, 0);
+  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 42, 5);
 
   batteryLabel = lv_label_create(screen);
   lv_label_set_text(batteryLabel, "BAT --");
-  lv_obj_set_style_text_font(batteryLabel, &lv_font_montserrat_14, 0);
-  lv_obj_align(batteryLabel, LV_ALIGN_TOP_RIGHT, -6, 4);
+  lv_obj_set_style_text_font(batteryLabel, &lv_font_montserrat_12, 0);
+  lv_obj_align(batteryLabel, LV_ALIGN_TOP_RIGHT, -6, 5);
 
   errorLabel = lv_label_create(screen);
   lv_label_set_text(errorLabel, "");
@@ -541,24 +564,32 @@ void createUi() {
     lv_obj_set_style_pad_all(wp, 0, 0);
     lv_obj_align(wp, LV_ALIGN_TOP_LEFT, 5, wpY);
 
-    static const int COL_W = 128;
-    for (int i = 0; i < 3; i++) {
+    static const int COL_W = 76;
+    for (int i = 0; i < WEATHER_DAYS; i++) {
       int cx = 6 + i * COL_W;
       lv_obj_t *dl = lv_label_create(wp);
       wDateLabels[i] = dl;
       lv_label_set_text(dl, "--/--");
-      lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+      lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
       lv_obj_set_width(dl, COL_W - 4);
       lv_label_set_long_mode(dl, LV_LABEL_LONG_CLIP);
-      lv_obj_align(dl, LV_ALIGN_TOP_LEFT, cx, 4);
+      lv_obj_align(dl, LV_ALIGN_TOP_LEFT, cx, 2);
 
       lv_obj_t *il = lv_label_create(wp);
       wInfoLabels[i] = il;
-      lv_label_set_text(il, "--/-- ---");
+      lv_label_set_text(il, "---");
       lv_obj_set_style_text_font(il, &lv_font_weather_cjk, 0);
       lv_obj_set_width(il, COL_W - 4);
       lv_label_set_long_mode(il, LV_LABEL_LONG_CLIP);
-      lv_obj_align(il, LV_ALIGN_TOP_LEFT, cx, 24);
+      lv_obj_align(il, LV_ALIGN_TOP_LEFT, cx, 14);
+
+      lv_obj_t *tl = lv_label_create(wp);
+      wTempLabels[i] = tl;
+      lv_label_set_text(tl, "--/--");
+      lv_obj_set_style_text_font(tl, &lv_font_montserrat_12, 0);
+      lv_obj_set_width(tl, COL_W - 4);
+      lv_label_set_long_mode(tl, LV_LABEL_LONG_CLIP);
+      lv_obj_align(tl, LV_ALIGN_TOP_LEFT, cx, 32);
     }
   }
 
@@ -573,11 +604,16 @@ void updateWeatherPanel() {
   if (!g_weatherValid) return;
   if (!Lvgl_lock(200)) return;
   lv_obj_clear_flag(weatherPanel, LV_OBJ_FLAG_HIDDEN);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < WEATHER_DAYS; i++) {
     lv_label_set_text(wDateLabels[i], g_weather[i].date);
-    char info[20];
-    snprintf(info, sizeof(info), "%s %s", g_weather[i].temp, wmoText(g_weather[i].code));
+    char info[16];
+    if (i == 0 && g_currentTempC > -1000) {
+      snprintf(info, sizeof(info), "%s %dC", wmoText(g_weather[i].code), g_currentTempC);
+    } else {
+      snprintf(info, sizeof(info), "%s", wmoText(g_weather[i].code));
+    }
     lv_label_set_text(wInfoLabels[i], info);
+    lv_label_set_text(wTempLabels[i], g_weather[i].temp);
   }
   Lvgl_unlock();
 }
@@ -625,6 +661,7 @@ void showSleepScreen() {
       lv_obj_add_flag(rowPanels[i], LV_OBJ_FLAG_HIDDEN);
     }
     lv_label_set_text(timeLabel, "--:--");
+    lv_label_set_text(wifiLabel, "");
     lv_label_set_text(batteryLabel, "");
     lv_label_set_text(footerLabel, "");
     char msg[52];
@@ -685,12 +722,15 @@ void refreshClockAndBattery(bool force = false) {
   char timeBuf[16];
   strftime(timeBuf, sizeof(timeBuf), "%H:%M", &timeinfo);
 
+  char wifiBuf[16];
+  snprintf(wifiBuf, sizeof(wifiBuf), "WiFi %s", WiFi.status() == WL_CONNECTED ? "OK" : "--");
+
   char battBuf[32];
-  float voltage = Adc_GetBatteryVoltage(NULL);
-  snprintf(battBuf, sizeof(battBuf), "BAT %u%% %.2fV", Adc_GetBatteryLevel(), voltage);
+  snprintf(battBuf, sizeof(battBuf), "BAT %u%%", Adc_GetBatteryLevel());
 
   if (Lvgl_lock(50)) {
     lv_label_set_text(timeLabel, timeBuf);
+    lv_label_set_text(wifiLabel, wifiBuf);
     lv_label_set_text(batteryLabel, battBuf);
     Lvgl_unlock();
   }

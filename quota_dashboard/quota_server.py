@@ -27,14 +27,15 @@ LAST_GOOD_ROWS = {
 WEATHER_API = (
     "https://api.open-meteo.com/v1/forecast"
     "?latitude=31.9927&longitude=118.7749"
+    "&current=temperature_2m"
     "&daily=temperature_2m_max,temperature_2m_min,weathercode"
-    "&timezone=Asia%2FShanghai&forecast_days=3"
+    "&timezone=Asia%2FShanghai&forecast_days=5"
 )
 WEATHER_CACHE: dict = {"days": None, "ts": 0.0}
 
 
 def load_weather():
-    """Fetch 3-day forecast. Cache for 1 hour."""
+    """Fetch 5-day forecast. Cache for 1 hour."""
     now_ts = datetime.now(tz=LOCAL_TZ).timestamp()
     if WEATHER_CACHE["days"] is not None and now_ts - WEATHER_CACHE["ts"] < 3600:
         return WEATHER_CACHE["days"]
@@ -42,15 +43,17 @@ def load_weather():
         data = json.loads(resp.read().decode())
     daily = data["daily"]
     days = []
-    for i in range(min(3, len(daily["time"]))):
+    current = data.get("current") or {}
+    current_temp = round(float(current.get("temperature_2m", 0))) if "temperature_2m" in current else None
+    for i in range(min(5, len(daily["time"]))):
         date_fmt = daily["time"][i][5:].replace("-", "/")  # "04/09"
         tmax = round(daily["temperature_2m_max"][i])
         tmin = round(daily["temperature_2m_min"][i])
         code = int(daily["weathercode"][i])
         days.append({"date": date_fmt, "temp": f"{tmax}/{tmin}", "code": code})
-    WEATHER_CACHE["days"] = days
+    WEATHER_CACHE["days"] = {"current_temp": current_temp, "days": days}
     WEATHER_CACHE["ts"] = now_ts
-    return days
+    return WEATHER_CACHE["days"]
 
 # China public holidays 2026 (ISO local dates)
 CHINA_HOLIDAYS_2026 = frozenset([
@@ -257,8 +260,13 @@ def build_text(snapshot):
     # Weather (cached 1h, non-fatal if unavailable)
     try:
         weather = load_weather()
-        wfields = "|".join(f"{d['date']}|{d['temp']}|{d['code']}" for d in weather)
-        lines.append(f"WEATHER|{wfields}")
+        cur = weather.get("current_temp")
+        days = weather.get("days", [])
+        wfields = "|".join(f"{d['date']}|{d['temp']}|{d['code']}" for d in days)
+        if cur is None:
+            lines.append(f"WEATHER|{wfields}")
+        else:
+            lines.append(f"WEATHER|{cur}|{wfields}")
     except Exception:
         pass
     return "\n".join(lines) + "\n"
