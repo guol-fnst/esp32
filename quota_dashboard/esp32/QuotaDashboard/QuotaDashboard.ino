@@ -2,6 +2,7 @@
 #include <HTTPClient.h>
 #include <time.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <esp_sleep.h>
 
 #include "display_bsp.h"
@@ -17,6 +18,10 @@ static const int SCREEN_HEIGHT = 300;
 static const int MAX_ROWS = 24;
 static const int VISIBLE_ROWS = 4;  // row 5 is reserved for weather
 static const int WEATHER_DAYS = 5;
+static const char *FIRMWARE_VERSION = "v11";
+static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000UL;
+static const unsigned long WIFI_RETRY_INTERVAL_MS = 15000UL;
+static const unsigned long SERVER_RETRY_INTERVAL_MS = 30000UL;
 
 // Row panel layout
 static const int ROW_H = 50;              // panel height px
@@ -50,10 +55,12 @@ char errorText[96] = "";
 time_t baseEpoch = 0;
 unsigned long baseEpochMillis = 0;
 unsigned long lastFetchMs = 0;
+unsigned long lastWifiAttemptMs = 0;
 unsigned long lastPageMs = 0;
 unsigned long lastClockMs = 0;
 unsigned long lastNtpSyncAttemptMs = 0;
 int currentPage = 0;
+bool lastFetchSucceeded = false;
 
 // Button debounce
 static unsigned long buttonPressMs = 0;
@@ -89,6 +96,34 @@ lv_obj_t *wTempLabels[WEATHER_DAYS];
 LV_FONT_DECLARE(lv_font_weather_cjk);
 
 void refreshClockAndBattery(bool force = false);
+bool connectWifi(bool force = false);
+bool fetchDashboard();
+bool fetchQuotaData();
+bool fetchWeatherData();
+
+const char *wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS: return "idle";
+    case WL_NO_SSID_AVAIL: return "ssid_not_found";
+    case WL_SCAN_COMPLETED: return "scan_done";
+    case WL_CONNECTED: return "connected";
+    case WL_CONNECT_FAILED: return "connect_failed";
+    case WL_CONNECTION_LOST: return "connection_lost";
+    case WL_DISCONNECTED: return "disconnected";
+    default: return "unknown";
+  }
+}
+
+void setErrorText(const char *text) {
+  safeCopy(errorText, sizeof(errorText), text);
+}
+
+void setErrorTextf(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(errorText, sizeof(errorText), fmt, args);
+  va_end(args);
+}
 
 const char* wmoText(int code) {
   if (code <= 1)  return "\u6674";           // 晴
@@ -181,7 +216,6 @@ void safeCopy(char *dst, size_t dstSize, const char *src) {
 
 void resetRows() {
   rowCount = 0;
-  errorText[0] = '\0';
 }
 
 int extractPercent(const char *text) {
@@ -361,56 +395,96 @@ bool parseDashboardPayload(String payload) {
     if (strncmp(buffer, "ERR|", 4) == 0) {
       safeCopy(errorText, sizeof(errorText), buffer + 4);
     }
-
-    if (strncmp(buffer, "WEATHER|", 8) == 0) {
-      // New format: WEATHER|curTemp|MM/DD|tmax/tmin|code|... (5 days)
-      // Legacy format: WEATHER|MM/DD|tmax/tmin|code|... (5 days)
-      char *wpNew[2 + WEATHER_DAYS * 3] = {0};
-      char *wpOld[1 + WEATHER_DAYS * 3] = {0};
-      if (splitField(buffer, wpNew, 2 + WEATHER_DAYS * 3)) {
-        bool ok = true;
-        g_currentTempC = atoi(wpNew[1]);
-        for (int i = 0; i < WEATHER_DAYS; i++) {
-          int b = 2 + i * 3;
-          if (!wpNew[b] || !wpNew[b + 1] || !wpNew[b + 2]) { ok = false; break; }
-          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wpNew[b]);
-          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wpNew[b + 1]);
-          g_weather[i].code = atoi(wpNew[b + 2]);
-        }
-        if (ok) g_weatherValid = true;
-      } else if (splitField(buffer, wpOld, 1 + WEATHER_DAYS * 3)) {
-        bool ok = true;
-        g_currentTempC = -1000;
-        for (int i = 0; i < WEATHER_DAYS; i++) {
-          int b = 1 + i * 3;
-          if (!wpOld[b] || !wpOld[b + 1] || !wpOld[b + 2]) { ok = false; break; }
-          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wpOld[b]);
-          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wpOld[b + 1]);
-          g_weather[i].code = atoi(wpOld[b + 2]);
-        }
-        if (ok) g_weatherValid = true;
-      }
-    }
   }
 
   return baseEpoch > 0;
 }
 
-bool fetchDashboard() {
+bool parseWeatherPayload(String payload) {
+  WeatherDay parsedWeather[WEATHER_DAYS];
+  int parsedCurrentTemp = -1000;
+  bool parsedValid = false;
+  int start = 0;
+
+  while (start < payload.length()) {
+    int end = payload.indexOf('\n', start);
+    if (end < 0) {
+      end = payload.length();
+    }
+    String line = payload.substring(start, end);
+    line.trim();
+    start = end + 1;
+    if (line.length() == 0) {
+      continue;
+    }
+
+    char buffer[192];
+    safeCopy(buffer, sizeof(buffer), line.c_str());
+    if (strncmp(buffer, "WEATHER|", 8) != 0) {
+      continue;
+    }
+
+    char *wpNew[2 + WEATHER_DAYS * 3] = {0};
+    char *wpOld[1 + WEATHER_DAYS * 3] = {0};
+    if (splitField(buffer, wpNew, 2 + WEATHER_DAYS * 3)) {
+      bool ok = true;
+      parsedCurrentTemp = atoi(wpNew[1]);
+      for (int i = 0; i < WEATHER_DAYS; i++) {
+        int base = 2 + i * 3;
+        if (!wpNew[base] || !wpNew[base + 1] || !wpNew[base + 2]) {
+          ok = false;
+          break;
+        }
+        safeCopy(parsedWeather[i].date, sizeof(parsedWeather[i].date), wpNew[base]);
+        safeCopy(parsedWeather[i].temp, sizeof(parsedWeather[i].temp), wpNew[base + 1]);
+        parsedWeather[i].code = atoi(wpNew[base + 2]);
+      }
+      parsedValid = ok;
+    } else if (splitField(buffer, wpOld, 1 + WEATHER_DAYS * 3)) {
+      bool ok = true;
+      parsedCurrentTemp = -1000;
+      for (int i = 0; i < WEATHER_DAYS; i++) {
+        int base = 1 + i * 3;
+        if (!wpOld[base] || !wpOld[base + 1] || !wpOld[base + 2]) {
+          ok = false;
+          break;
+        }
+        safeCopy(parsedWeather[i].date, sizeof(parsedWeather[i].date), wpOld[base]);
+        safeCopy(parsedWeather[i].temp, sizeof(parsedWeather[i].temp), wpOld[base + 1]);
+        parsedWeather[i].code = atoi(wpOld[base + 2]);
+      }
+      parsedValid = ok;
+    }
+
+    if (parsedValid) {
+      for (int i = 0; i < WEATHER_DAYS; i++) {
+        g_weather[i] = parsedWeather[i];
+      }
+      g_currentTempC = parsedCurrentTemp;
+      g_weatherValid = true;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool fetchQuotaData() {
   if (WiFi.status() != WL_CONNECTED) {
-    safeCopy(errorText, sizeof(errorText), "WiFi disconnected");
-    Serial.println("[fetch] WiFi disconnected");
+    setErrorTextf("WiFi %s", wifiStatusName(WiFi.status()));
+    Serial.printf("[quota] WiFi unavailable status=%s\n", wifiStatusName(WiFi.status()));
     return false;
   }
 
   HTTPClient http;
-  http.begin(DASHBOARD_URL);
+  http.begin(QUOTA_URL);
   http.setConnectTimeout(5000);
+  http.setTimeout(8000);
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     String err = http.errorToString(code);
-    snprintf(errorText, sizeof(errorText), "HTTP %d %s", code, err.c_str());
-    Serial.printf("[fetch] GET failed code=%d err=%s url=%s\n", code, err.c_str(), DASHBOARD_URL);
+    setErrorTextf("Quota HTTP %d %s", code, err.c_str());
+    Serial.printf("[quota] GET failed code=%d err=%s url=%s\n", code, err.c_str(), QUOTA_URL);
     http.end();
     return false;
   }
@@ -418,30 +492,97 @@ bool fetchDashboard() {
   String payload = http.getString();
   http.end();
   if (!parseDashboardPayload(payload)) {
-    safeCopy(errorText, sizeof(errorText), "Parse failed");
-    Serial.printf("[fetch] Parse failed url=%s\n", DASHBOARD_URL);
+    setErrorText("Quota parse failed");
+    Serial.printf("[quota] Parse failed url=%s\n", QUOTA_URL);
     return false;
   }
-  errorText[0] = '\0';
-  Serial.printf("[fetch] OK rows=%d weather=%d\n", rowCount, g_weatherValid ? 1 : 0);
+
+  Serial.printf("[quota] OK rows=%d\n", rowCount);
   return true;
 }
 
-void connectWifi() {
+bool fetchWeatherData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!errorText[0]) {
+      setErrorTextf("WiFi %s", wifiStatusName(WiFi.status()));
+    }
+    Serial.printf("[weather] WiFi unavailable status=%s\n", wifiStatusName(WiFi.status()));
+    return false;
+  }
+
+  HTTPClient http;
+  http.begin(WEATHER_URL);
+  http.setConnectTimeout(5000);
+  http.setTimeout(8000);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    String err = http.errorToString(code);
+    if (!errorText[0]) {
+      setErrorTextf("Weather HTTP %d %s", code, err.c_str());
+    }
+    Serial.printf("[weather] GET failed code=%d err=%s url=%s\n", code, err.c_str(), WEATHER_URL);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+  if (!parseWeatherPayload(payload)) {
+    if (!errorText[0]) {
+      setErrorText("Weather parse failed");
+    }
+    Serial.printf("[weather] Parse failed url=%s\n", WEATHER_URL);
+    return false;
+  }
+
+  Serial.printf("[weather] OK current=%d valid=%d\n", g_currentTempC, g_weatherValid ? 1 : 0);
+  return true;
+}
+
+bool fetchDashboard() {
+  errorText[0] = '\0';
+  bool quotaOk = fetchQuotaData();
+  bool weatherOk = fetchWeatherData();
+  if (quotaOk && weatherOk && !errorText[0]) {
+    Serial.printf("[fetch] OK rows=%d weather=%d\n", rowCount, g_weatherValid ? 1 : 0);
+  }
+  return quotaOk;
+}
+
+bool connectWifi(bool force) {
+  unsigned long nowMs = millis();
+  if (!force && WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+  if (!force && nowMs - lastWifiAttemptMs < WIFI_RETRY_INTERVAL_MS) {
+    return WiFi.status() == WL_CONNECTED;
+  }
+  lastWifiAttemptMs = nowMs;
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+  WiFi.disconnect(false, true);
+  delay(100);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
     delay(500);
   }
+
   if (WiFi.status() == WL_CONNECTED) {
 #if defined(WIFI_PS_MIN_MODEM)
     WiFi.setSleep(WIFI_PS_MIN_MODEM);
 #else
     WiFi.setSleep(true);
 #endif
+    errorText[0] = '\0';
+    Serial.printf("[wifi] connected ip=%s rssi=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return true;
   }
+
+  setErrorTextf("WiFi %s", wifiStatusName(WiFi.status()));
+  Serial.printf("[wifi] connect failed status=%s ssid=%s\n", wifiStatusName(WiFi.status()), WIFI_SSID);
+  return false;
 }
 
 bool hasSystemTime() {
@@ -477,21 +618,15 @@ void createUi() {
   lv_obj_set_style_text_color(screen, lv_color_black(), 0);
   lv_obj_set_style_pad_all(screen, 0, 0);
 
-  // ---- header row ----
-  lv_obj_t *title = lv_label_create(screen);
-  lv_label_set_text(title, "Quota Dashboard v10");
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 8, 5);
-
   timeLabel = lv_label_create(screen);
   lv_label_set_text(timeLabel, "--:--");
   lv_obj_set_style_text_font(timeLabel, &lv_font_montserrat_12, 0);
-  lv_obj_align(timeLabel, LV_ALIGN_TOP_MID, -38, 5);
+  lv_obj_align(timeLabel, LV_ALIGN_TOP_LEFT, 8, 5);
 
   wifiLabel = lv_label_create(screen);
   lv_label_set_text(wifiLabel, "WiFi --");
   lv_obj_set_style_text_font(wifiLabel, &lv_font_montserrat_12, 0);
-  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 42, 5);
+  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 6, 5);
 
   batteryLabel = lv_label_create(screen);
   lv_label_set_text(batteryLabel, "BAT --");
@@ -641,7 +776,7 @@ void createUi() {
 
   // ---- footer ----
   footerLabel = lv_label_create(screen);
-  lv_label_set_text(footerLabel, "OpenAI Rows 0  Page 1/1  Sync -");
+  lv_label_set_text(footerLabel, "v11  CX | AG  0 users  P1/1  Sync -");
   lv_obj_set_style_text_font(footerLabel, &lv_font_montserrat_14, 0);
   lv_obj_align(footerLabel, LV_ALIGN_BOTTOM_LEFT, 8, -4);
 
@@ -907,8 +1042,8 @@ void renderRows() {
     }
 
     char footer[80];
-    snprintf(footer, sizeof(footer), "CX | AG  %d users  P%d/%d  %s",
-             activeCount, currentPage + 1, pageCount, lastSyncText);
+    snprintf(footer, sizeof(footer), "%s  CX | AG  %d users  P%d/%d  %s",
+         FIRMWARE_VERSION, activeCount, currentPage + 1, pageCount, lastSyncText);
     lv_label_set_text(footerLabel, footer);
     Lvgl_unlock();
   }
@@ -937,9 +1072,9 @@ void setup() {
   Lvgl_PortInit(SCREEN_WIDTH, SCREEN_HEIGHT, Lvgl_FlushCallback);
   createUi();
 
-  connectWifi();
+  connectWifi(true);
   syncTimeFromNtp(true);
-  fetchDashboard();
+  lastFetchSucceeded = fetchDashboard();
   renderRows();
   refreshClockAndBattery(true);  // check work hours after first render
   lastFetchMs = millis();
@@ -952,7 +1087,7 @@ void checkButton() {
   if (state == LOW && buttonLastState == HIGH && millis() - buttonPressMs > 50) {
     buttonPressMs = millis();
     // Trigger immediate fetch and render
-    fetchDashboard();
+    lastFetchSucceeded = fetchDashboard();
     renderRows();
     lastFetchMs = millis();
     refreshClockAndBattery(true);
@@ -968,8 +1103,9 @@ void loop() {
   }
   syncTimeFromNtp();
 
-  if (millis() - lastFetchMs >= FETCH_INTERVAL_MS) {
-    fetchDashboard();
+  unsigned long fetchIntervalMs = lastFetchSucceeded ? FETCH_INTERVAL_MS : SERVER_RETRY_INTERVAL_MS;
+  if (millis() - lastFetchMs >= fetchIntervalMs) {
+    lastFetchSucceeded = fetchDashboard();
     renderRows();
     lastFetchMs = millis();
   }

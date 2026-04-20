@@ -12,6 +12,7 @@ $pythonExe = Join-Path $workspaceDir ".venv\Scripts\python.exe"
 $serverPy = Join-Path $repoDir "quota_server.py"
 $outLog = Join-Path $repoDir "server.out.log"
 $errLog = Join-Path $repoDir "server.err.log"
+$powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 
 if (-not (Test-Path $pythonExe)) {
     throw "Python not found: $pythonExe"
@@ -21,9 +22,11 @@ if (-not (Test-Path $serverPy)) {
     throw "Server script not found: $serverPy"
 }
 
-$arg = '"' + $serverPy + '" >> "' + $outLog + '" 2>> "' + $errLog + '"'
+$command = '& "' + $pythonExe + '" "' + $serverPy + '" 1>> "' + $outLog + '" 2>> "' + $errLog + '"'
+$encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+$arg = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ' + $encodedCommand
 
-$action = New-ScheduledTaskAction -Execute $pythonExe -Argument $arg -WorkingDirectory $repoDir
+$action = New-ScheduledTaskAction -Execute $powershellExe -Argument $arg -WorkingDirectory $repoDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
