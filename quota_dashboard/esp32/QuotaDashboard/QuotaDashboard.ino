@@ -42,6 +42,8 @@ DisplayPort RlcdPort(12, 11, 5, 40, 41, SCREEN_WIDTH, SCREEN_HEIGHT);
 DashboardRow rows[MAX_ROWS];
 int rowCount = 0;
 bool g_isHoliday = false;  // set by server HOLIDAY line each fetch
+int g_holidayYear = -1;
+int g_holidayYday = -1;
 char lastSyncText[25] = "-";
 char errorText[96] = "";
 
@@ -50,6 +52,7 @@ unsigned long baseEpochMillis = 0;
 unsigned long lastFetchMs = 0;
 unsigned long lastPageMs = 0;
 unsigned long lastClockMs = 0;
+unsigned long lastNtpSyncAttemptMs = 0;
 int currentPage = 0;
 
 // Button debounce
@@ -84,6 +87,8 @@ lv_obj_t *wInfoLabels[WEATHER_DAYS];
 lv_obj_t *wTempLabels[WEATHER_DAYS];
 
 LV_FONT_DECLARE(lv_font_weather_cjk);
+
+void refreshClockAndBattery(bool force = false);
 
 const char* wmoText(int code) {
   if (code <= 1)  return "\u6674";           // 晴
@@ -297,6 +302,8 @@ int buildCombinedRows() {
 bool parseDashboardPayload(String payload) {
   resetRows();
   g_isHoliday = false;  // assume workday; server overrides if today is a holiday
+  g_holidayYear = -1;
+  g_holidayYday = -1;
   int start = 0;
   while (start < payload.length()) {
     int end = payload.indexOf('\n', start);
@@ -325,6 +332,13 @@ bool parseDashboardPayload(String payload) {
 
     if (strncmp(buffer, "HOLIDAY|", 8) == 0) {
       g_isHoliday = (buffer[8] == '1');
+      if (g_isHoliday && baseEpoch > 0) {
+        time_t nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+        struct tm t;
+        gmtime_r(&nowLocal, &t);
+        g_holidayYear = t.tm_year;
+        g_holidayYday = t.tm_yday;
+      }
       continue;
     }
 
@@ -385,6 +399,7 @@ bool parseDashboardPayload(String payload) {
 bool fetchDashboard() {
   if (WiFi.status() != WL_CONNECTED) {
     safeCopy(errorText, sizeof(errorText), "WiFi disconnected");
+    Serial.println("[fetch] WiFi disconnected");
     return false;
   }
 
@@ -395,6 +410,7 @@ bool fetchDashboard() {
   if (code != HTTP_CODE_OK) {
     String err = http.errorToString(code);
     snprintf(errorText, sizeof(errorText), "HTTP %d %s", code, err.c_str());
+    Serial.printf("[fetch] GET failed code=%d err=%s url=%s\n", code, err.c_str(), DASHBOARD_URL);
     http.end();
     return false;
   }
@@ -403,9 +419,11 @@ bool fetchDashboard() {
   http.end();
   if (!parseDashboardPayload(payload)) {
     safeCopy(errorText, sizeof(errorText), "Parse failed");
+    Serial.printf("[fetch] Parse failed url=%s\n", DASHBOARD_URL);
     return false;
   }
   errorText[0] = '\0';
+  Serial.printf("[fetch] OK rows=%d weather=%d\n", rowCount, g_weatherValid ? 1 : 0);
   return true;
 }
 
@@ -426,7 +444,34 @@ void connectWifi() {
   }
 }
 
+bool hasSystemTime() {
+  return time(nullptr) > 1700000000;
+}
+
+void syncTimeFromNtp(bool force = false) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  unsigned long nowMs = millis();
+  if (!force && nowMs - lastNtpSyncAttemptMs < 10UL * 60UL * 1000UL) {
+    return;
+  }
+  lastNtpSyncAttemptMs = nowMs;
+
+  configTime(TIMEZONE_OFFSET_SECONDS, 0, "ntp.aliyun.com", "ntp.ntsc.ac.cn", "pool.ntp.org");
+  for (int i = 0; i < 10; i++) {
+    if (hasSystemTime()) {
+      return;
+    }
+    delay(200);
+  }
+}
+
 void createUi() {
+  if (!Lvgl_lock(1000)) {
+    return;
+  }
+
   lv_obj_t *screen = lv_scr_act();
   lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
   lv_obj_set_style_text_color(screen, lv_color_black(), 0);
@@ -434,7 +479,7 @@ void createUi() {
 
   // ---- header row ----
   lv_obj_t *title = lv_label_create(screen);
-  lv_label_set_text(title, "Quota Dashboard v9");
+  lv_label_set_text(title, "Quota Dashboard v10");
   lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 8, 5);
 
@@ -455,11 +500,12 @@ void createUi() {
 
   errorLabel = lv_label_create(screen);
   lv_label_set_text(errorLabel, "");
-  lv_obj_set_width(errorLabel, 380);
+  lv_obj_set_width(errorLabel, 220);
   lv_obj_set_style_text_color(errorLabel, lv_color_black(), 0);
-  lv_obj_set_style_text_font(errorLabel, &lv_font_montserrat_14, 0);
-  // Positioned at top-left; only visible when errorText is non-empty
-  lv_obj_align(errorLabel, LV_ALIGN_TOP_LEFT, 10, 4);
+  lv_obj_set_style_text_font(errorLabel, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_RIGHT, 0);
+  // Keep error text away from title/version area to avoid overlap.
+  lv_obj_align(errorLabel, LV_ALIGN_TOP_RIGHT, -8, 5);
 
   // ---- 5 row panels ----
   for (int i = 0; i < VISIBLE_ROWS; i++) {
@@ -598,6 +644,8 @@ void createUi() {
   lv_label_set_text(footerLabel, "OpenAI Rows 0  Page 1/1  Sync -");
   lv_obj_set_style_text_font(footerLabel, &lv_font_montserrat_14, 0);
   lv_obj_align(footerLabel, LV_ALIGN_BOTTOM_LEFT, 8, -4);
+
+  Lvgl_unlock();
 }
 
 void updateWeatherPanel() {
@@ -622,8 +670,14 @@ void updateWeatherPanel() {
 
 // True if current local time is Mon-Fri 09:00-19:59
 bool isWorkHours() {
-  if (baseEpoch <= 0) return true;  // no time sync: stay active
-  time_t nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+  time_t nowLocal = 0;
+  if (baseEpoch > 0) {
+    nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+  } else if (hasSystemTime()) {
+    nowLocal = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
+  } else {
+    return true;  // no valid time yet: stay active
+  }
   struct tm t;
   gmtime_r(&nowLocal, &t);
   if (t.tm_wday == 0 || t.tm_wday == 6) return false;  // Sun / Sat
@@ -632,7 +686,14 @@ bool isWorkHours() {
 
 // Returns "local epoch" (UTC+8 as fake-UTC) of next weekday 09:00
 time_t nextWorkWakeEpoch() {
-  time_t nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+  time_t nowLocal = 0;
+  if (baseEpoch > 0) {
+    nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+  } else if (hasSystemTime()) {
+    nowLocal = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
+  } else {
+    nowLocal = TIMEZONE_OFFSET_SECONDS;
+  }
   struct tm t;
   gmtime_r(&nowLocal, &t);
   struct tm wake = t;
@@ -674,6 +735,35 @@ void showSleepScreen() {
   delay(4000);  // let e-ink finish refreshing before power-down
 }
 
+bool isHolidayStillActive() {
+  if (!g_isHoliday) {
+    return false;
+  }
+  if (g_holidayYear < 0 || g_holidayYday < 0) {
+    return g_isHoliday;
+  }
+
+  time_t nowLocal = 0;
+  if (baseEpoch > 0) {
+    nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
+  } else if (hasSystemTime()) {
+    nowLocal = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
+  } else {
+    return g_isHoliday;
+  }
+  struct tm t;
+  gmtime_r(&nowLocal, &t);
+  if (t.tm_year == g_holidayYear && t.tm_yday == g_holidayYday) {
+    return true;
+  }
+
+  // Day changed: clear stale holiday flag until next server fetch updates it.
+  g_isHoliday = false;
+  g_holidayYear = -1;
+  g_holidayYday = -1;
+  return false;
+}
+
 void enterOffHoursMode() {
   showSleepScreen();       // display retention: e-ink shows this while CPU sleeps
   WiFi.disconnect(true);
@@ -682,7 +772,7 @@ void enterOffHoursMode() {
 
   // Light sleep in 5-minute intervals until work hours resume.
   // Light sleep preserves PSRAM, so LVGL state remains intact.
-  while (g_isHoliday || !isWorkHours()) {
+  while (isHolidayStillActive() || !isWorkHours()) {
     esp_sleep_enable_timer_wakeup(5ULL * 60ULL * 1000000ULL);  // 5 min
     esp_light_sleep_start();  // CPU halts here; millis() continues via RTC
     // woke up due to timer — loop to re-check time
@@ -690,8 +780,8 @@ void enterOffHoursMode() {
 
   // Work hours resumed — restore screen and reconnect
   if (Lvgl_lock(1000)) {
-    lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_align(errorLabel, LV_ALIGN_TOP_LEFT, 10, 4);
+    lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(errorLabel, LV_ALIGN_TOP_RIGHT, -8, 5);
     lv_label_set_text(errorLabel, "");
     for (int i = 0; i < VISIBLE_ROWS; i++) {
       lv_obj_clear_flag(rowPanels[i], LV_OBJ_FLAG_HIDDEN);
@@ -699,28 +789,36 @@ void enterOffHoursMode() {
     Lvgl_unlock();
   }
   connectWifi();
-  g_isHoliday = false;  // stale flag; next fetchDashboard will set it correctly
+
+  // Refresh immediately after waking so header/weather/data are not stale for up to FETCH_INTERVAL_MS.
+  if (fetchDashboard()) {
+    renderRows();
+  }
+  refreshClockAndBattery(true);
 }
 
 // ----------------------------------------------
 
-void refreshClockAndBattery(bool force = false) {
-  if (baseEpoch <= 0) {
-    return;
-  }
-
+void refreshClockAndBattery(bool force) {
   // Only refresh once per minute (or on force)
   if (!force && millis() - lastClockMs < 60000UL) {
     return;
   }
   lastClockMs = millis();
 
-  time_t currentEpoch = baseEpoch + ((millis() - baseEpochMillis) / 1000UL) + TIMEZONE_OFFSET_SECONDS;
-  struct tm timeinfo;
-  localtime_r(&currentEpoch, &timeinfo);
-
   char timeBuf[16];
-  strftime(timeBuf, sizeof(timeBuf), "%H:%M", &timeinfo);
+  safeCopy(timeBuf, sizeof(timeBuf), "--:--");
+  if (hasSystemTime()) {
+    time_t currentEpoch = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
+    struct tm timeinfo;
+    gmtime_r(&currentEpoch, &timeinfo);
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M", &timeinfo);
+  } else if (baseEpoch > 0) {
+    time_t currentEpoch = baseEpoch + ((millis() - baseEpochMillis) / 1000UL) + TIMEZONE_OFFSET_SECONDS;
+    struct tm timeinfo;
+    gmtime_r(&currentEpoch, &timeinfo);
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M", &timeinfo);
+  }
 
   char wifiBuf[16];
   snprintf(wifiBuf, sizeof(wifiBuf), "WiFi %s", WiFi.status() == WL_CONNECTED ? "OK" : "--");
@@ -732,11 +830,12 @@ void refreshClockAndBattery(bool force = false) {
     lv_label_set_text(timeLabel, timeBuf);
     lv_label_set_text(wifiLabel, wifiBuf);
     lv_label_set_text(batteryLabel, battBuf);
+    lv_label_set_text(errorLabel, errorText[0] ? errorText : "");
     Lvgl_unlock();
   }
 
   // Check work schedule once per minute; light sleep if outside hours or holiday
-  if (g_isHoliday || !isWorkHours()) {
+  if (isHolidayStillActive() || !isWorkHours()) {
     enterOffHoursMode();
   }
 }
@@ -750,7 +849,7 @@ void renderRows() {
   int startIndex = currentPage * VISIBLE_ROWS;
 
   if (Lvgl_lock(200)) {
-    lv_label_set_text(errorLabel, "");
+    lv_label_set_text(errorLabel, errorText[0] ? errorText : "");
 
     for (int i = 0; i < VISIBLE_ROWS; i++) {
       int index = startIndex + i;
@@ -839,6 +938,7 @@ void setup() {
   createUi();
 
   connectWifi();
+  syncTimeFromNtp(true);
   fetchDashboard();
   renderRows();
   refreshClockAndBattery(true);  // check work hours after first render
@@ -852,9 +952,8 @@ void checkButton() {
   if (state == LOW && buttonLastState == HIGH && millis() - buttonPressMs > 50) {
     buttonPressMs = millis();
     // Trigger immediate fetch and render
-    if (fetchDashboard()) {
-      renderRows();
-    }
+    fetchDashboard();
+    renderRows();
     lastFetchMs = millis();
     refreshClockAndBattery(true);
   }
@@ -867,11 +966,11 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWifi();
   }
+  syncTimeFromNtp();
 
   if (millis() - lastFetchMs >= FETCH_INTERVAL_MS) {
-    if (fetchDashboard()) {
-      renderRows();
-    }
+    fetchDashboard();
+    renderRows();
     lastFetchMs = millis();
   }
 

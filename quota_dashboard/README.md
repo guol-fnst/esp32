@@ -91,6 +91,28 @@ netsh advfirewall firewall show rule name="quota-dashboard"
 curl http://<你的电脑IP>:8765/health
 ```
 
+## 开机自启动（Windows）
+
+仓库已提供任务计划程序脚本：
+
+- 安装并立即启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_autostart.ps1
+```
+
+- 移除自启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\remove_autostart.ps1
+```
+
+默认任务名为 `QuotaDashboardServer`，会在当前用户登录后自动启动 `quota_server.py`。
+日志输出到：
+
+- `server.out.log`
+- `server.err.log`
+
 ## Arduino 推荐参数
 
 - Board: `ESP32S3 Dev Module`

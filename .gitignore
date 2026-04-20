@@ -1,0 +1,17 @@
+# Python
+.venv/
+**/__pycache__/
+**/*.pyc
+
+# Quota dashboard build and runtime artifacts
+quota_dashboard/build/
+quota_dashboard/build_psram/
+quota_dashboard/server.out.log
+quota_dashboard/server.err.log
+quota_dashboard/npm_list.txt
+quota_dashboard/esp_txt_snapshot.txt
+quota_dashboard/path_check.txt
+quota_dashboard/compile_latest.log
+quota_dashboard/*_out.txt
+quota_dashboard/*_err.txt
+quota_dashboard/*_status.txt
