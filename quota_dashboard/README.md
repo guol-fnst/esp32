@@ -16,13 +16,15 @@
 启动：
 
 ```powershell
-C:\Users\leile\AppData\Local\Programs\Python\Python311\python.exe D:\codex\quota_dashboard\quota_server.py
+f:\esp32\.venv\Scripts\python.exe .\quota_server.py
 ```
 
 接口：
 
 - `http://127.0.0.1:8765/health`
 - `http://127.0.0.1:8765/api/summary.json`
+- `http://127.0.0.1:8765/api/quota.txt`
+- `http://127.0.0.1:8765/api/weather.txt`
 - `http://127.0.0.1:8765/api/esp.txt`
 
 服务默认监听 `0.0.0.0:8765`，局域网访问请使用本机 IP。
@@ -41,12 +43,14 @@ ROW|CX|leilei4365@gmail.com|5H 21%|1W 21%|04-10 18:01
 
 - `WIFI_SSID`
 - `WIFI_PASSWORD`
-- `DASHBOARD_URL`
+- `QUOTA_URL`
+- `WEATHER_URL`
 
 如果你的电脑局域网 IP 是 `192.168.1.100`，则：
 
 ```cpp
-static const char *DASHBOARD_URL = "http://192.168.1.100:8765/api/esp.txt";
+static const char *QUOTA_URL = "http://192.168.1.100:8765/api/quota.txt";
+static const char *WEATHER_URL = "http://192.168.1.100:8765/api/weather.txt";
 ```
 
 默认刷新周期为 5 分钟，可在 `config.h` 中修改 `FETCH_INTERVAL_MS`。
@@ -93,7 +97,13 @@ curl http://<你的电脑IP>:8765/health
 
 ## 开机自启动（Windows）
 
-仓库已提供任务计划程序脚本：
+仓库已提供“启动文件夹”自启动脚本，不依赖任务计划程序。
+
+安装后会在当前用户的 Startup 目录写入：
+
+- `QuotaDashboardServer.cmd`
+
+该启动器会在登录 Windows 后通过 `pythonw.exe` 后台启动 `quota_server.py`，不依赖任务计划程序，也不会常驻一个命令行窗口。
 
 - 安装并立即启动：
 
@@ -107,11 +117,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_autostart.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\remove_autostart.ps1
 ```
 
-默认任务名为 `QuotaDashboardServer`，会在当前用户登录后自动启动 `quota_server.py`。
-日志输出到：
+验证方式：
 
-- `server.out.log`
-- `server.err.log`
+```powershell
+curl http://127.0.0.1:8765/health
+```
+
+如果你想手动重启服务，可直接运行：
+
+```powershell
+f:\esp32\.venv\Scripts\python.exe .\quota_server.py
+```
+
+如果你要排查启动问题，建议临时改用上面的前台命令运行，这样能直接看到异常输出。
 
 ## Arduino 推荐参数
 

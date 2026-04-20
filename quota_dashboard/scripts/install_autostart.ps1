@@ -1,7 +1,3 @@
-param(
-    [string]$TaskName = "QuotaDashboardServer"
-)
-
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -9,35 +5,51 @@ $repoDir = Resolve-Path (Join-Path $scriptDir "..")
 $workspaceDir = Resolve-Path (Join-Path $repoDir "..")
 
 $pythonExe = Join-Path $workspaceDir ".venv\Scripts\python.exe"
+$pythonwExe = Join-Path $workspaceDir ".venv\Scripts\pythonw.exe"
 $serverPy = Join-Path $repoDir "quota_server.py"
-$outLog = Join-Path $repoDir "server.out.log"
-$errLog = Join-Path $repoDir "server.err.log"
-$powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$startupDir = [Environment]::GetFolderPath("Startup")
+$launcherPath = Join-Path $startupDir "QuotaDashboardServer.cmd"
 
 if (-not (Test-Path $pythonExe)) {
     throw "Python not found: $pythonExe"
+}
+
+if (-not (Test-Path $pythonwExe)) {
+    throw "Pythonw not found: $pythonwExe"
 }
 
 if (-not (Test-Path $serverPy)) {
     throw "Server script not found: $serverPy"
 }
 
-$command = '& "' + $pythonExe + '" "' + $serverPy + '" 1>> "' + $outLog + '" 2>> "' + $errLog + '"'
-$encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-$arg = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ' + $encodedCommand
+$launcherContent = @(
+    '@echo off'
+    'cd /d "' + $repoDir + '"'
+    'start "QuotaDashboardServer" /b "' + $pythonwExe + '" "' + $serverPy + '"'
+) -join [Environment]::NewLine
 
-$action = New-ScheduledTaskAction -Execute $powershellExe -Argument $arg -WorkingDirectory $repoDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+Set-Content -Path $launcherPath -Value $launcherContent -Encoding ASCII
 
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+# Remove legacy scheduled task if it exists.
+if (Get-ScheduledTask -TaskName "QuotaDashboardServer" -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName "QuotaDashboardServer" -Confirm:$false
 }
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
+$legacyVbs = Join-Path $startupDir "QuotaDashboardServer.vbs"
+if (Test-Path $legacyVbs) {
+    Remove-Item $legacyVbs -Force
+}
 
-# Start now so the setting takes effect immediately.
-Start-ScheduledTask -TaskName $TaskName
+$running = $false
+try {
+    $response = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/health -TimeoutSec 2
+    $running = ($response.StatusCode -eq 200)
+} catch {
+    $running = $false
+}
 
-Write-Host "Installed and started scheduled task: $TaskName"
+if (-not $running) {
+    Start-Process -FilePath $pythonwExe -ArgumentList @($serverPy) -WorkingDirectory $repoDir -WindowStyle Hidden
+}
+
+Write-Host "Installed startup launcher: $launcherPath"
