@@ -240,7 +240,7 @@ def build_snapshot():
     }
 
 
-def build_quota_text(snapshot):
+def build_text(snapshot):
     lines = [f"META|{snapshot['epoch']}|{safe_text(snapshot['updated_at'], 24)}|{snapshot['count']}"]
     lines.append(f"HOLIDAY|{1 if is_holiday_today() else 0}")
     for row in snapshot["rows"]:
@@ -257,24 +257,19 @@ def build_quota_text(snapshot):
         )
     if snapshot["errors"]:
         lines.append("ERR|" + safe_text("; ".join(snapshot["errors"]), 180))
-    return "\n".join(lines) + "\n"
-
-
-def build_weather_text():
+    # Weather (cached 1h, non-fatal if unavailable)
     try:
         weather = load_weather()
         cur = weather.get("current_temp")
         days = weather.get("days", [])
         wfields = "|".join(f"{d['date']}|{d['temp']}|{d['code']}" for d in days)
         if cur is None:
-            return f"WEATHER|{wfields}\n"
-        return f"WEATHER|{cur}|{wfields}\n"
-    except Exception as exc:
-        return "ERR|weather: " + safe_text(exc, 160) + "\n"
-
-
-def build_dashboard_text(snapshot):
-    return build_quota_text(snapshot) + build_weather_text()
+            lines.append(f"WEATHER|{wfields}")
+        else:
+            lines.append(f"WEATHER|{cur}|{wfields}")
+    except Exception:
+        pass
+    return "\n".join(lines) + "\n"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -296,14 +291,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/api/summary.json", "/"):
             self._send(200, "application/json; charset=utf-8", json.dumps(snapshot, ensure_ascii=False, indent=2))
             return
-        if self.path == "/api/quota.txt":
-            self._send(200, "text/plain; charset=utf-8", build_quota_text(snapshot))
-            return
-        if self.path == "/api/weather.txt":
-            self._send(200, "text/plain; charset=utf-8", build_weather_text())
-            return
         if self.path == "/api/esp.txt":
-            self._send(200, "text/plain; charset=utf-8", build_dashboard_text(snapshot))
+            self._send(200, "text/plain; charset=utf-8", build_text(snapshot))
             return
 
         self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not found"}))

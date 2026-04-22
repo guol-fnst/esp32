@@ -18,10 +18,9 @@ static const int SCREEN_HEIGHT = 300;
 static const int MAX_ROWS = 24;
 static const int VISIBLE_ROWS = 4;  // row 5 is reserved for weather
 static const int WEATHER_DAYS = 5;
-static const char *FIRMWARE_VERSION = "v11";
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 15000UL;
-static const unsigned long SERVER_RETRY_INTERVAL_MS = 30000UL;
+static const unsigned long FETCH_RETRY_INTERVAL_MS = 30000UL;
 
 // Row panel layout
 static const int ROW_H = 50;              // panel height px
@@ -47,20 +46,17 @@ DisplayPort RlcdPort(12, 11, 5, 40, 41, SCREEN_WIDTH, SCREEN_HEIGHT);
 DashboardRow rows[MAX_ROWS];
 int rowCount = 0;
 bool g_isHoliday = false;  // set by server HOLIDAY line each fetch
-int g_holidayYear = -1;
-int g_holidayYday = -1;
 char lastSyncText[25] = "-";
 char errorText[96] = "";
 
 time_t baseEpoch = 0;
 unsigned long baseEpochMillis = 0;
 unsigned long lastFetchMs = 0;
-unsigned long lastWifiAttemptMs = 0;
 unsigned long lastPageMs = 0;
 unsigned long lastClockMs = 0;
-unsigned long lastNtpSyncAttemptMs = 0;
+unsigned long lastWifiAttemptMs = 0;
 int currentPage = 0;
-bool lastFetchSucceeded = false;
+bool lastFetchOk = false;
 
 // Button debounce
 static unsigned long buttonPressMs = 0;
@@ -94,12 +90,6 @@ lv_obj_t *wInfoLabels[WEATHER_DAYS];
 lv_obj_t *wTempLabels[WEATHER_DAYS];
 
 LV_FONT_DECLARE(lv_font_weather_cjk);
-
-void refreshClockAndBattery(bool force = false);
-bool connectWifi(bool force = false);
-bool fetchDashboard();
-bool fetchQuotaData();
-bool fetchWeatherData();
 
 const char *wifiStatusName(wl_status_t status) {
   switch (status) {
@@ -336,8 +326,6 @@ int buildCombinedRows() {
 bool parseDashboardPayload(String payload) {
   resetRows();
   g_isHoliday = false;  // assume workday; server overrides if today is a holiday
-  g_holidayYear = -1;
-  g_holidayYday = -1;
   int start = 0;
   while (start < payload.length()) {
     int end = payload.indexOf('\n', start);
@@ -366,13 +354,6 @@ bool parseDashboardPayload(String payload) {
 
     if (strncmp(buffer, "HOLIDAY|", 8) == 0) {
       g_isHoliday = (buffer[8] == '1');
-      if (g_isHoliday && baseEpoch > 0) {
-        time_t nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
-        struct tm t;
-        gmtime_r(&nowLocal, &t);
-        g_holidayYear = t.tm_year;
-        g_holidayYday = t.tm_yday;
-      }
       continue;
     }
 
@@ -395,96 +376,57 @@ bool parseDashboardPayload(String payload) {
     if (strncmp(buffer, "ERR|", 4) == 0) {
       safeCopy(errorText, sizeof(errorText), buffer + 4);
     }
+
+    if (strncmp(buffer, "WEATHER|", 8) == 0) {
+      // New format: WEATHER|curTemp|MM/DD|tmax/tmin|code|... (5 days)
+      // Legacy format: WEATHER|MM/DD|tmax/tmin|code|... (5 days)
+      char *wpNew[2 + WEATHER_DAYS * 3] = {0};
+      char *wpOld[1 + WEATHER_DAYS * 3] = {0};
+      if (splitField(buffer, wpNew, 2 + WEATHER_DAYS * 3)) {
+        bool ok = true;
+        g_currentTempC = atoi(wpNew[1]);
+        for (int i = 0; i < WEATHER_DAYS; i++) {
+          int b = 2 + i * 3;
+          if (!wpNew[b] || !wpNew[b + 1] || !wpNew[b + 2]) { ok = false; break; }
+          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wpNew[b]);
+          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wpNew[b + 1]);
+          g_weather[i].code = atoi(wpNew[b + 2]);
+        }
+        if (ok) g_weatherValid = true;
+      } else if (splitField(buffer, wpOld, 1 + WEATHER_DAYS * 3)) {
+        bool ok = true;
+        g_currentTempC = -1000;
+        for (int i = 0; i < WEATHER_DAYS; i++) {
+          int b = 1 + i * 3;
+          if (!wpOld[b] || !wpOld[b + 1] || !wpOld[b + 2]) { ok = false; break; }
+          safeCopy(g_weather[i].date, sizeof(g_weather[i].date), wpOld[b]);
+          safeCopy(g_weather[i].temp, sizeof(g_weather[i].temp), wpOld[b + 1]);
+          g_weather[i].code = atoi(wpOld[b + 2]);
+        }
+        if (ok) g_weatherValid = true;
+      }
+    }
   }
 
   return baseEpoch > 0;
 }
 
-bool parseWeatherPayload(String payload) {
-  WeatherDay parsedWeather[WEATHER_DAYS];
-  int parsedCurrentTemp = -1000;
-  bool parsedValid = false;
-  int start = 0;
-
-  while (start < payload.length()) {
-    int end = payload.indexOf('\n', start);
-    if (end < 0) {
-      end = payload.length();
-    }
-    String line = payload.substring(start, end);
-    line.trim();
-    start = end + 1;
-    if (line.length() == 0) {
-      continue;
-    }
-
-    char buffer[192];
-    safeCopy(buffer, sizeof(buffer), line.c_str());
-    if (strncmp(buffer, "WEATHER|", 8) != 0) {
-      continue;
-    }
-
-    char *wpNew[2 + WEATHER_DAYS * 3] = {0};
-    char *wpOld[1 + WEATHER_DAYS * 3] = {0};
-    if (splitField(buffer, wpNew, 2 + WEATHER_DAYS * 3)) {
-      bool ok = true;
-      parsedCurrentTemp = atoi(wpNew[1]);
-      for (int i = 0; i < WEATHER_DAYS; i++) {
-        int base = 2 + i * 3;
-        if (!wpNew[base] || !wpNew[base + 1] || !wpNew[base + 2]) {
-          ok = false;
-          break;
-        }
-        safeCopy(parsedWeather[i].date, sizeof(parsedWeather[i].date), wpNew[base]);
-        safeCopy(parsedWeather[i].temp, sizeof(parsedWeather[i].temp), wpNew[base + 1]);
-        parsedWeather[i].code = atoi(wpNew[base + 2]);
-      }
-      parsedValid = ok;
-    } else if (splitField(buffer, wpOld, 1 + WEATHER_DAYS * 3)) {
-      bool ok = true;
-      parsedCurrentTemp = -1000;
-      for (int i = 0; i < WEATHER_DAYS; i++) {
-        int base = 1 + i * 3;
-        if (!wpOld[base] || !wpOld[base + 1] || !wpOld[base + 2]) {
-          ok = false;
-          break;
-        }
-        safeCopy(parsedWeather[i].date, sizeof(parsedWeather[i].date), wpOld[base]);
-        safeCopy(parsedWeather[i].temp, sizeof(parsedWeather[i].temp), wpOld[base + 1]);
-        parsedWeather[i].code = atoi(wpOld[base + 2]);
-      }
-      parsedValid = ok;
-    }
-
-    if (parsedValid) {
-      for (int i = 0; i < WEATHER_DAYS; i++) {
-        g_weather[i] = parsedWeather[i];
-      }
-      g_currentTempC = parsedCurrentTemp;
-      g_weatherValid = true;
-      return true;
-    }
-  }
-
-  return false;
-}
-
-bool fetchQuotaData() {
+bool fetchDashboard() {
   if (WiFi.status() != WL_CONNECTED) {
     setErrorTextf("WiFi %s", wifiStatusName(WiFi.status()));
-    Serial.printf("[quota] WiFi unavailable status=%s\n", wifiStatusName(WiFi.status()));
+    Serial.printf("[fetch] WiFi unavailable status=%s\n", wifiStatusName(WiFi.status()));
     return false;
   }
 
   HTTPClient http;
-  http.begin(QUOTA_URL);
+  http.begin(DASHBOARD_URL);
   http.setConnectTimeout(5000);
   http.setTimeout(8000);
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     String err = http.errorToString(code);
-    setErrorTextf("Quota HTTP %d %s", code, err.c_str());
-    Serial.printf("[quota] GET failed code=%d err=%s url=%s\n", code, err.c_str(), QUOTA_URL);
+    setErrorTextf("HTTP %d %s", code, err.c_str());
+    Serial.printf("[fetch] GET failed code=%d err=%s\n", code, err.c_str());
     http.end();
     return false;
   }
@@ -492,64 +434,16 @@ bool fetchQuotaData() {
   String payload = http.getString();
   http.end();
   if (!parseDashboardPayload(payload)) {
-    setErrorText("Quota parse failed");
-    Serial.printf("[quota] Parse failed url=%s\n", QUOTA_URL);
+    setErrorText("Parse failed");
+    Serial.println("[fetch] Parse failed");
     return false;
   }
-
-  Serial.printf("[quota] OK rows=%d\n", rowCount);
-  return true;
-}
-
-bool fetchWeatherData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!errorText[0]) {
-      setErrorTextf("WiFi %s", wifiStatusName(WiFi.status()));
-    }
-    Serial.printf("[weather] WiFi unavailable status=%s\n", wifiStatusName(WiFi.status()));
-    return false;
-  }
-
-  HTTPClient http;
-  http.begin(WEATHER_URL);
-  http.setConnectTimeout(5000);
-  http.setTimeout(8000);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    String err = http.errorToString(code);
-    if (!errorText[0]) {
-      setErrorTextf("Weather HTTP %d %s", code, err.c_str());
-    }
-    Serial.printf("[weather] GET failed code=%d err=%s url=%s\n", code, err.c_str(), WEATHER_URL);
-    http.end();
-    return false;
-  }
-
-  String payload = http.getString();
-  http.end();
-  if (!parseWeatherPayload(payload)) {
-    if (!errorText[0]) {
-      setErrorText("Weather parse failed");
-    }
-    Serial.printf("[weather] Parse failed url=%s\n", WEATHER_URL);
-    return false;
-  }
-
-  Serial.printf("[weather] OK current=%d valid=%d\n", g_currentTempC, g_weatherValid ? 1 : 0);
-  return true;
-}
-
-bool fetchDashboard() {
   errorText[0] = '\0';
-  bool quotaOk = fetchQuotaData();
-  bool weatherOk = fetchWeatherData();
-  if (quotaOk && weatherOk && !errorText[0]) {
-    Serial.printf("[fetch] OK rows=%d weather=%d\n", rowCount, g_weatherValid ? 1 : 0);
-  }
-  return quotaOk;
+  Serial.printf("[fetch] OK rows=%d weather=%d\n", rowCount, g_weatherValid ? 1 : 0);
+  return true;
 }
 
-bool connectWifi(bool force) {
+bool connectWifi(bool force = false) {
   unsigned long nowMs = millis();
   if (!force && WiFi.status() == WL_CONNECTED) {
     return true;
@@ -568,7 +462,6 @@ bool connectWifi(bool force) {
   while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
     delay(500);
   }
-
   if (WiFi.status() == WL_CONNECTED) {
 #if defined(WIFI_PS_MIN_MODEM)
     WiFi.setSleep(WIFI_PS_MIN_MODEM);
@@ -585,48 +478,27 @@ bool connectWifi(bool force) {
   return false;
 }
 
-bool hasSystemTime() {
-  return time(nullptr) > 1700000000;
-}
-
-void syncTimeFromNtp(bool force = false) {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-  unsigned long nowMs = millis();
-  if (!force && nowMs - lastNtpSyncAttemptMs < 10UL * 60UL * 1000UL) {
-    return;
-  }
-  lastNtpSyncAttemptMs = nowMs;
-
-  configTime(TIMEZONE_OFFSET_SECONDS, 0, "ntp.aliyun.com", "ntp.ntsc.ac.cn", "pool.ntp.org");
-  for (int i = 0; i < 10; i++) {
-    if (hasSystemTime()) {
-      return;
-    }
-    delay(200);
-  }
-}
-
 void createUi() {
-  if (!Lvgl_lock(1000)) {
-    return;
-  }
-
   lv_obj_t *screen = lv_scr_act();
   lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
   lv_obj_set_style_text_color(screen, lv_color_black(), 0);
   lv_obj_set_style_pad_all(screen, 0, 0);
 
+  // ---- header row ----
+  lv_obj_t *title = lv_label_create(screen);
+  lv_label_set_text(title, "Quota Dashboard v9");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 8, 5);
+
   timeLabel = lv_label_create(screen);
   lv_label_set_text(timeLabel, "--:--");
   lv_obj_set_style_text_font(timeLabel, &lv_font_montserrat_12, 0);
-  lv_obj_align(timeLabel, LV_ALIGN_TOP_LEFT, 8, 5);
+  lv_obj_align(timeLabel, LV_ALIGN_TOP_MID, -38, 5);
 
   wifiLabel = lv_label_create(screen);
   lv_label_set_text(wifiLabel, "WiFi --");
   lv_obj_set_style_text_font(wifiLabel, &lv_font_montserrat_12, 0);
-  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 6, 5);
+  lv_obj_align(wifiLabel, LV_ALIGN_TOP_MID, 42, 5);
 
   batteryLabel = lv_label_create(screen);
   lv_label_set_text(batteryLabel, "BAT --");
@@ -635,12 +507,11 @@ void createUi() {
 
   errorLabel = lv_label_create(screen);
   lv_label_set_text(errorLabel, "");
-  lv_obj_set_width(errorLabel, 220);
+  lv_obj_set_width(errorLabel, 380);
   lv_obj_set_style_text_color(errorLabel, lv_color_black(), 0);
-  lv_obj_set_style_text_font(errorLabel, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_RIGHT, 0);
-  // Keep error text away from title/version area to avoid overlap.
-  lv_obj_align(errorLabel, LV_ALIGN_TOP_RIGHT, -8, 5);
+  lv_obj_set_style_text_font(errorLabel, &lv_font_montserrat_14, 0);
+  // Positioned at top-left; only visible when errorText is non-empty
+  lv_obj_align(errorLabel, LV_ALIGN_TOP_LEFT, 10, 4);
 
   // ---- 5 row panels ----
   for (int i = 0; i < VISIBLE_ROWS; i++) {
@@ -776,11 +647,9 @@ void createUi() {
 
   // ---- footer ----
   footerLabel = lv_label_create(screen);
-  lv_label_set_text(footerLabel, "v11  CX | AG  0 users  P1/1  Sync -");
+  lv_label_set_text(footerLabel, "OpenAI Rows 0  Page 1/1  Sync -");
   lv_obj_set_style_text_font(footerLabel, &lv_font_montserrat_14, 0);
   lv_obj_align(footerLabel, LV_ALIGN_BOTTOM_LEFT, 8, -4);
-
-  Lvgl_unlock();
 }
 
 void updateWeatherPanel() {
@@ -803,52 +672,54 @@ void updateWeatherPanel() {
 
 // ---------- Sleep / schedule helpers ----------
 
+static time_t nowUtcEpoch() {
+  return baseEpoch + (millis() - baseEpochMillis) / 1000UL;
+}
+
+static void toLocalTm(time_t utcEpoch, struct tm *out) {
+  time_t localEpoch = utcEpoch + TIMEZONE_OFFSET_SECONDS;
+  gmtime_r(&localEpoch, out);
+}
+
 // True if current local time is Mon-Fri 09:00-19:59
 bool isWorkHours() {
-  time_t nowLocal = 0;
-  if (baseEpoch > 0) {
-    nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
-  } else if (hasSystemTime()) {
-    nowLocal = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
-  } else {
-    return true;  // no valid time yet: stay active
-  }
+  if (baseEpoch <= 0) return true;  // no time sync: stay active
+  time_t nowUtc = nowUtcEpoch();
   struct tm t;
-  gmtime_r(&nowLocal, &t);
+  toLocalTm(nowUtc, &t);
   if (t.tm_wday == 0 || t.tm_wday == 6) return false;  // Sun / Sat
   return (t.tm_hour >= 9 && t.tm_hour < 20);
 }
 
-// Returns "local epoch" (UTC+8 as fake-UTC) of next weekday 09:00
+// Returns UTC epoch of next weekday 09:00 in configured local timezone.
 time_t nextWorkWakeEpoch() {
-  time_t nowLocal = 0;
-  if (baseEpoch > 0) {
-    nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
-  } else if (hasSystemTime()) {
-    nowLocal = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
-  } else {
-    nowLocal = TIMEZONE_OFFSET_SECONDS;
-  }
+  time_t nowUtc = nowUtcEpoch();
   struct tm t;
-  gmtime_r(&nowLocal, &t);
-  struct tm wake = t;
-  wake.tm_hour = 9;
-  wake.tm_min  = 0;
-  wake.tm_sec  = 0;
-  time_t wakeLocal = mktime(&wake);
-  for (int i = 0; i < 7; i++) {
-    struct tm w;
-    gmtime_r(&wakeLocal, &w);
-    if (w.tm_wday != 0 && w.tm_wday != 6 && wakeLocal > nowLocal) return wakeLocal;
-    wakeLocal += 86400;
+  toLocalTm(nowUtc, &t);
+
+  int daysAhead = 0;
+  for (; daysAhead < 8; daysAhead++) {
+    int wday = (t.tm_wday + daysAhead) % 7;
+    bool weekday = (wday >= 1 && wday <= 5);
+    if (!weekday) continue;
+    if (daysAhead == 0 && t.tm_hour >= 9) continue;
+    break;
   }
-  return nowLocal + 86400;  // fallback: 24 h
+  if (daysAhead >= 8) {
+    daysAhead = 1;  // fallback
+  }
+
+  time_t nowLocal = nowUtc + TIMEZONE_OFFSET_SECONDS;
+  int secOfDay = t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec;
+  time_t localMidnight = nowLocal - secOfDay;
+  time_t wakeLocal = localMidnight + (time_t)daysAhead * 86400 + 9 * 3600;
+  return wakeLocal - TIMEZONE_OFFSET_SECONDS;
 }
 
 void showSleepScreen() {
   time_t wakeEpoch = nextWorkWakeEpoch();
   struct tm w;
-  gmtime_r(&wakeEpoch, &w);
+  toLocalTm(wakeEpoch, &w);
   char wakeStr[20];
   strftime(wakeStr, sizeof(wakeStr), "%m/%d %H:%M", &w);
 
@@ -870,35 +741,6 @@ void showSleepScreen() {
   delay(4000);  // let e-ink finish refreshing before power-down
 }
 
-bool isHolidayStillActive() {
-  if (!g_isHoliday) {
-    return false;
-  }
-  if (g_holidayYear < 0 || g_holidayYday < 0) {
-    return g_isHoliday;
-  }
-
-  time_t nowLocal = 0;
-  if (baseEpoch > 0) {
-    nowLocal = baseEpoch + (millis() - baseEpochMillis) / 1000UL + TIMEZONE_OFFSET_SECONDS;
-  } else if (hasSystemTime()) {
-    nowLocal = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
-  } else {
-    return g_isHoliday;
-  }
-  struct tm t;
-  gmtime_r(&nowLocal, &t);
-  if (t.tm_year == g_holidayYear && t.tm_yday == g_holidayYday) {
-    return true;
-  }
-
-  // Day changed: clear stale holiday flag until next server fetch updates it.
-  g_isHoliday = false;
-  g_holidayYear = -1;
-  g_holidayYday = -1;
-  return false;
-}
-
 void enterOffHoursMode() {
   showSleepScreen();       // display retention: e-ink shows this while CPU sleeps
   WiFi.disconnect(true);
@@ -907,7 +749,7 @@ void enterOffHoursMode() {
 
   // Light sleep in 5-minute intervals until work hours resume.
   // Light sleep preserves PSRAM, so LVGL state remains intact.
-  while (isHolidayStillActive() || !isWorkHours()) {
+  while (g_isHoliday || !isWorkHours()) {
     esp_sleep_enable_timer_wakeup(5ULL * 60ULL * 1000000ULL);  // 5 min
     esp_light_sleep_start();  // CPU halts here; millis() continues via RTC
     // woke up due to timer — loop to re-check time
@@ -915,8 +757,8 @@ void enterOffHoursMode() {
 
   // Work hours resumed — restore screen and reconnect
   if (Lvgl_lock(1000)) {
-    lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_align(errorLabel, LV_ALIGN_TOP_RIGHT, -8, 5);
+    lv_obj_set_style_text_align(errorLabel, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_align(errorLabel, LV_ALIGN_TOP_LEFT, 10, 4);
     lv_label_set_text(errorLabel, "");
     for (int i = 0; i < VISIBLE_ROWS; i++) {
       lv_obj_clear_flag(rowPanels[i], LV_OBJ_FLAG_HIDDEN);
@@ -924,17 +766,12 @@ void enterOffHoursMode() {
     Lvgl_unlock();
   }
   connectWifi();
-
-  // Refresh immediately after waking so header/weather/data are not stale for up to FETCH_INTERVAL_MS.
-  if (fetchDashboard()) {
-    renderRows();
-  }
-  refreshClockAndBattery(true);
+  g_isHoliday = false;  // stale flag; next fetchDashboard will set it correctly
 }
 
 // ----------------------------------------------
 
-void refreshClockAndBattery(bool force) {
+void refreshClockAndBattery(bool force = false) {
   // Only refresh once per minute (or on force)
   if (!force && millis() - lastClockMs < 60000UL) {
     return;
@@ -943,20 +780,15 @@ void refreshClockAndBattery(bool force) {
 
   char timeBuf[16];
   safeCopy(timeBuf, sizeof(timeBuf), "--:--");
-  if (hasSystemTime()) {
-    time_t currentEpoch = time(nullptr) + TIMEZONE_OFFSET_SECONDS;
+  if (baseEpoch > 0) {
+    time_t currentEpoch = nowUtcEpoch();
     struct tm timeinfo;
-    gmtime_r(&currentEpoch, &timeinfo);
-    strftime(timeBuf, sizeof(timeBuf), "%H:%M", &timeinfo);
-  } else if (baseEpoch > 0) {
-    time_t currentEpoch = baseEpoch + ((millis() - baseEpochMillis) / 1000UL) + TIMEZONE_OFFSET_SECONDS;
-    struct tm timeinfo;
-    gmtime_r(&currentEpoch, &timeinfo);
+    toLocalTm(currentEpoch, &timeinfo);
     strftime(timeBuf, sizeof(timeBuf), "%H:%M", &timeinfo);
   }
 
   char wifiBuf[16];
-  snprintf(wifiBuf, sizeof(wifiBuf), "WiFi %s", WiFi.status() == WL_CONNECTED ? "OK" : "--");
+  snprintf(wifiBuf, sizeof(wifiBuf), "WiFi %s", WiFi.status() == WL_CONNECTED ? "OK" : wifiStatusName(WiFi.status()));
 
   char battBuf[32];
   snprintf(battBuf, sizeof(battBuf), "BAT %u%%", Adc_GetBatteryLevel());
@@ -970,7 +802,7 @@ void refreshClockAndBattery(bool force) {
   }
 
   // Check work schedule once per minute; light sleep if outside hours or holiday
-  if (isHolidayStillActive() || !isWorkHours()) {
+  if (g_isHoliday || !isWorkHours()) {
     enterOffHoursMode();
   }
 }
@@ -1026,7 +858,7 @@ void renderRows() {
 
       } else if (activeCount == 0 && i == 0) {
         lv_label_set_text(rowTitleLabels[i], "No data");
-        lv_label_set_text(rowDetailLabels[i], "Source offline");
+        lv_label_set_text(rowDetailLabels[i], errorText[0] ? errorText : "Source offline");
         lv_label_set_text(rowCxLabels[i], "--");
         lv_arc_set_value(rowCxArcs[i], 0);
         lv_arc_set_value(rowAgOuterArcs[i], 0);
@@ -1042,8 +874,8 @@ void renderRows() {
     }
 
     char footer[80];
-    snprintf(footer, sizeof(footer), "%s  CX | AG  %d users  P%d/%d  %s",
-         FIRMWARE_VERSION, activeCount, currentPage + 1, pageCount, lastSyncText);
+    snprintf(footer, sizeof(footer), "CX | AG  %d users  P%d/%d  %s",
+             activeCount, currentPage + 1, pageCount, lastSyncText);
     lv_label_set_text(footerLabel, footer);
     Lvgl_unlock();
   }
@@ -1073,8 +905,7 @@ void setup() {
   createUi();
 
   connectWifi(true);
-  syncTimeFromNtp(true);
-  lastFetchSucceeded = fetchDashboard();
+  lastFetchOk = fetchDashboard();
   renderRows();
   refreshClockAndBattery(true);  // check work hours after first render
   lastFetchMs = millis();
@@ -1087,7 +918,7 @@ void checkButton() {
   if (state == LOW && buttonLastState == HIGH && millis() - buttonPressMs > 50) {
     buttonPressMs = millis();
     // Trigger immediate fetch and render
-    lastFetchSucceeded = fetchDashboard();
+    lastFetchOk = fetchDashboard();
     renderRows();
     lastFetchMs = millis();
     refreshClockAndBattery(true);
@@ -1101,11 +932,10 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWifi();
   }
-  syncTimeFromNtp();
 
-  unsigned long fetchIntervalMs = lastFetchSucceeded ? FETCH_INTERVAL_MS : SERVER_RETRY_INTERVAL_MS;
-  if (millis() - lastFetchMs >= fetchIntervalMs) {
-    lastFetchSucceeded = fetchDashboard();
+  unsigned long fetchInterval = lastFetchOk ? FETCH_INTERVAL_MS : FETCH_RETRY_INTERVAL_MS;
+  if (millis() - lastFetchMs >= fetchInterval) {
+    lastFetchOk = fetchDashboard();
     renderRows();
     lastFetchMs = millis();
   }

@@ -97,13 +97,18 @@ curl http://<你的电脑IP>:8765/health
 
 ## 开机自启动（Windows）
 
-仓库已提供“启动文件夹”自启动脚本，不依赖任务计划程序。
+仓库已提供“守护进程 + 双通道登录自启动”脚本，不依赖任务计划程序。
 
-安装后会在当前用户的 Startup 目录写入：
+安装后会创建两条登录自启动入口：
 
 - `QuotaDashboardServer.cmd`
+- `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run` 下的 `QuotaDashboardServer`
 
-该启动器会在登录 Windows 后通过 `pythonw.exe` 后台启动 `quota_server.py`，不依赖任务计划程序，也不会常驻一个命令行窗口。
+启动目标不是直接运行服务脚本，而是运行 `scripts/quota_server_supervisor.ps1`。守护脚本会：
+
+- 保证同一会话只有一个守护实例
+- 监控 `quota_server.py` 进程
+- 进程退出后 3 秒自动拉起
 
 - 安装并立即启动：
 
@@ -120,6 +125,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\remove_autostart.ps1
 验证方式：
 
 ```powershell
+curl http://127.0.0.1:8765/health
+```
+
+自动重启验证（可选）：
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'quota_server.py' } | Select-Object ProcessId,CommandLine
+Stop-Process -Id <上一步进程ID> -Force
+Start-Sleep -Seconds 5
 curl http://127.0.0.1:8765/health
 ```
 
