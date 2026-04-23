@@ -97,14 +97,13 @@ curl http://<你的电脑IP>:8765/health
 
 ## 开机自启动（Windows）
 
-仓库已提供“守护进程 + 双通道登录自启动”脚本，不依赖任务计划程序。
+仓库已提供“守护进程 + 单一登录自启动”脚本，不依赖任务计划程序。
 
-安装后会创建两条登录自启动入口：
+安装后只保留一条登录自启动入口：
 
-- `QuotaDashboardServer.cmd`
 - `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run` 下的 `QuotaDashboardServer`
 
-启动目标不是直接运行服务脚本，而是运行 `scripts/quota_server_supervisor.ps1`。守护脚本会：
+启动目标不是直接运行服务脚本，而是运行 `scripts/quota_server_supervisor.ps1`。这样可以避免多个启动项同时拉起同一服务。守护脚本会：
 
 - 保证同一会话只有一个守护实例
 - 监控 `quota_server.py` 进程

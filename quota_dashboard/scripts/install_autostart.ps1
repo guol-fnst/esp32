@@ -26,14 +26,11 @@ if (-not (Test-Path $supervisorPs1)) {
 }
 
 $supervisorCmd = '"' + $powershellExe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $supervisorPs1 + '"'
-
-$launcherContent = @(
-    '@echo off'
-    $supervisorCmd
-) -join [Environment]::NewLine
-
-Set-Content -Path $launcherPath -Value $launcherContent -Encoding ASCII
 Set-ItemProperty -Path $runKeyPath -Name $runValueName -Value $supervisorCmd -Type String
+
+if (Test-Path $launcherPath) {
+    Remove-Item $launcherPath -Force
+}
 
 # Remove legacy scheduled task if it exists.
 if (Get-ScheduledTask -TaskName "QuotaDashboardServer" -ErrorAction SilentlyContinue) {
@@ -47,6 +44,5 @@ if (Test-Path $legacyVbs) {
 
 Start-Process -FilePath $powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $supervisorPs1) -WorkingDirectory $repoDir -WindowStyle Hidden
 
-Write-Host "Installed startup launcher: $launcherPath"
-Write-Host "Installed HKCU Run entry: $runValueName"
+Write-Host "Installed single startup entry via HKCU Run: $runValueName"
 Write-Host "Supervisor script: $supervisorPs1"
